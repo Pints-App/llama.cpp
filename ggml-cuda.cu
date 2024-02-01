@@ -6566,13 +6566,15 @@ static __global__ void flash_attn_ext_f16(
                     for (int64_t j = 0; j < Q16; ++j) {
                         half16x16_a mqka;
                         half16x16_acc mm;
+                        if(mp) {
+                            nvcuda::wmma::load_matrix_sync(mm, mp + 16*j*(nb31/sizeof(half)) + ic + 16*cc, nb31/sizeof(half), nvcuda::wmma::mem_row_major);
+                        }
 
                         // convert accumulator to matrix_a
                         nvcuda::wmma::store_matrix_sync(      ss + 16*j*T + 16*cc, mqk[j], T, nvcuda::wmma::mem_row_major);
                         nvcuda::wmma::load_matrix_sync (mqka, ss + 16*j*T + 16*cc, T);
 
-                        nvcuda::wmma::load_matrix_sync(mm, mp + 16*j*(nb31/sizeof(half)) + ic + 16*cc, nb31/sizeof(half), nvcuda::wmma::mem_row_major);
-                        nvcuda::wmma::mma_sync(mqk[j], mqka, mscale, mm);
+                        nvcuda::wmma::mma_sync(mqk[j], mqka, mscale, mp ? mm : zr);
                         nvcuda::wmma::store_matrix_sync(ss + 16*j*T + 16*cc, mqk[j], T, nvcuda::wmma::mem_row_major);
                     }
                 }

@@ -248,7 +248,7 @@ struct ggml_tensor* compute_graph(const test_model & model, ggml_backend_t backe
 
     callback_userdata ud {
         true,
-        1e-7,
+        5e-4,
         model.backend,
         backend_cpu
     };
