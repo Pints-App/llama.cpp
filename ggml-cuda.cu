@@ -662,7 +662,7 @@ static __device__ __forceinline__ half2 warp_reduce_sum(half2 a) {
 }
 
 static __device__ __forceinline__ half warp_reduce_sum(half x) {
-#ifdef __CUDA_ARCH__ >= CC_VOLTA
+#if __CUDA_ARCH__ >= CC_VOLTA
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
         x = __hadd(__shfl_xor_sync(0xffffffff, x, mask, 32), x);
@@ -6601,8 +6601,8 @@ static __global__ void flash_attn_ext_f16(
                     smax = warp_reduce_max(__hmax(smax, s));
                     M[j] = warp_reduce_max(__hmax(M[j], s));
 
-                    const half ms = __hisinf(m) ? __float2half(0.0f) : hexp(m - M[j]);
-                    const half vs = __hisinf(s) ? __float2half(0.0f) : hexp(s - M[j]);
+                    const half ms = __hisinf(m) == -1 ? __float2half(0.0f) : hexp(m - M[j]);
+                    const half vs = __hisinf(s) == -1 ? __float2half(0.0f) : hexp(s - M[j]);
 
                     S[j] = S[j]*ms + warp_reduce_sum(vs);
 
@@ -6628,7 +6628,7 @@ static __global__ void flash_attn_ext_f16(
                     smax = warp_reduce_max(smax);
                     M[j] = warp_reduce_max(M[j]);
 
-                    const half ms = __hisinf(m) ? __float2half(0.0f) : hexp(m - M[j]);
+                    const half ms = __hisinf(m) == -1 ? __float2half(0.0f) : hexp(m - M[j]);
 
                     // create a QxQ diagonal matrix for rescaling the output
                     if (lane_id == j) {
@@ -6641,7 +6641,7 @@ static __global__ void flash_attn_ext_f16(
                     for (int64_t p = lane_id; p < C; p += NW) {
                         const half s = ss[j*T + p];
 
-                        const half vs = __hisinf(s) ? __float2half(0.0f) : hexp(s - M[j]);
+                        const half vs = __hisinf(s) == -1 ? __float2half(0.0f) : hexp(s - M[j]);
 
                         ls += vs;
 
@@ -6654,7 +6654,7 @@ static __global__ void flash_attn_ext_f16(
             }
 
             // skip -INF blocks
-            if (__hisinf(smax)) {
+            if (__hisinf(smax) == -1) {
                 continue;
             }
 
@@ -6740,8 +6740,8 @@ static __global__ void flash_attn_ext_f16(
 
                 M = __hmax(M0, M1);
 
-                const half ms0 = __hisinf(M0) ? __float2half(0.0f) : hexp(M0 - M);
-                const half ms1 = __hisinf(M1) ? __float2half(0.0f) : hexp(M1 - M);
+                const half ms0 = __hisinf(M0) == -1 ? __float2half(0.0f) : hexp(M0 - M);
+                const half ms1 = __hisinf(M1) == -1 ? __float2half(0.0f) : hexp(M1 - M);
 
                 S = S0*ms0 + S1*ms1;
 
