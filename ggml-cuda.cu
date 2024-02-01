@@ -661,12 +661,17 @@ static __device__ __forceinline__ half2 warp_reduce_sum(half2 a) {
 #endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && __CUDA_ARCH__ >= CC_PASCAL
 }
 
-static __device__ __forceinline__ __half warp_reduce_sum(__half x) {
+static __device__ __forceinline__ half warp_reduce_sum(half x) {
+#ifdef __CUDA_ARCH__ >= CC_VOLTA
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
-        x += __shfl_xor_sync(0xffffffff, x, mask, 32);
+        x = __hadd(__shfl_xor_sync(0xffffffff, x, mask, 32), x);
     }
     return x;
+#else
+    (void) x;
+    NO_DEVICE_CODE;
+#endif
 }
 
 static __device__ __forceinline__ float warp_reduce_max(float x) {
@@ -6403,6 +6408,7 @@ typedef nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda:
 typedef nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::row_major> half16x16_b;
 typedef nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::col_major> half16x16_bT;
 typedef nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, half>                     half16x16_acc;
+#endif
 
 // based on metal version
 template<int D, int Q, int C> // D head size, Q queries per block, C cache items per block
@@ -6433,6 +6439,7 @@ static __global__ void flash_attn_ext_f16(
         int ne1,
         int ne2,
         int ne3) {
+#if __CUDA_ARCH__ >= CC_VOLTA
     const int warp_id = threadIdx.y;
     const int lane_id = threadIdx.x;
 
@@ -6791,38 +6798,10 @@ static __global__ void flash_attn_ext_f16(
             }
         }
     }
-}
 #else
-template<int D, int Q, int C> // D head size, Q queries per block, C cache items per blocks
-static __global__ void flash_attn_ext_f16(
-        const char* __restrict__ q,
-        const char* __restrict__ k,
-        const char* __restrict__ v,
-        const char* __restrict__ mask,
-        float* __restrict__ kqv,
-        float scale,
-        int ne00,
-        int ne01,
-        int ne02,
-        int ne03,
-        int ne10,
-        int ne11,
-        int ne12,
-        int ne13,
-        int ne31,
-        int nb31,
-        int nb01,
-        int nb02,
-        int nb03,
-        int nb11,
-        int nb12,
-        int nb13,
-        int ne0,
-        int ne1,
-        int ne2,
-        int ne3) {
-        }
+    NO_DEVICE_CODE;
 #endif
+}
 
 template<int qk, int qr, dequantize_kernel_t dq>
 static void get_rows_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
