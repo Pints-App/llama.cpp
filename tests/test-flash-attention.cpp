@@ -105,7 +105,7 @@ void load_model(test_model & model, int head_dim, int batch_size, int kv_size, i
     float* query = new float[head_dim * batch_size * num_heads];
     float* key = new float[head_dim * kv_size * num_heads];
     float* value = new float[head_dim * kv_size * num_heads];
-    float* mask = new float[kv_size * batch_size];
+    float* mask = new float[kv_size * GGML_PAD(batch_size, GGML_KQ_MASK_PAD)];
 
     for(int i = 0; i < head_dim*batch_size*num_heads;i ++) {
         query[i] = i % 3 ? 2.0f : 1.5f;
@@ -116,8 +116,8 @@ void load_model(test_model & model, int head_dim, int batch_size, int kv_size, i
         value[i] = i % 3 ? 3.5f : 1.5f;
     }
 
-    for(int i = 0; i < batch_size*kv_size;i ++) {
-        mask[i] = i % 3 ? 1.0f : 0.0f;
+    for(int i = 0; i < GGML_PAD(batch_size, GGML_KQ_MASK_PAD)*kv_size;i ++) {
+        mask[i] = i % 3 ? 1.0f : 1.5f;
     }
 
     size_t buffer_size = 0;
@@ -125,7 +125,7 @@ void load_model(test_model & model, int head_dim, int batch_size, int kv_size, i
         buffer_size += head_dim * batch_size * num_heads * ggml_type_sizef(GGML_TYPE_F32); // tensor q
         buffer_size += head_dim * kv_size * num_heads * ggml_type_sizef(GGML_TYPE_F16); // tensor k
         buffer_size += head_dim * kv_size * num_heads * ggml_type_sizef(GGML_TYPE_F16); // tensor v
-        buffer_size += batch_size * kv_size * ggml_type_sizef(GGML_TYPE_F32); // tensor mask
+        buffer_size += GGML_PAD(batch_size, GGML_KQ_MASK_PAD) * kv_size * ggml_type_sizef(GGML_TYPE_F16); // tensor mask
         buffer_size += 1024;
     }
 
@@ -162,7 +162,7 @@ void load_model(test_model & model, int head_dim, int batch_size, int kv_size, i
     model.q = ggml_new_tensor_3d(model.ctx, GGML_TYPE_F32, head_dim, batch_size, num_heads);
     model.k = ggml_new_tensor_3d(model.ctx, GGML_TYPE_F16, head_dim, kv_size, num_heads);
     model.v = ggml_new_tensor_3d(model.ctx, GGML_TYPE_F16, head_dim, kv_size, num_heads);
-    model.msk = ggml_new_tensor_2d(model.ctx, GGML_TYPE_F32, kv_size, batch_size);
+    model.msk = ggml_new_tensor_2d(model.ctx, GGML_TYPE_F16, kv_size, GGML_PAD(batch_size, GGML_KQ_MASK_PAD));
 
     // create a allocator
     ggml_allocr * alloc = ggml_allocr_new_from_buffer(model.buffer);
@@ -175,14 +175,16 @@ void load_model(test_model & model, int head_dim, int batch_size, int kv_size, i
 
     ggml_fp16_t* k_f16 = new ggml_fp16_t[head_dim * kv_size * num_heads];
     ggml_fp16_t* v_f16 = new ggml_fp16_t[head_dim * kv_size * num_heads];
+    ggml_fp16_t* m_f16 = new ggml_fp16_t[GGML_PAD(batch_size, GGML_KQ_MASK_PAD) * kv_size];
 
     ggml_fp32_to_fp16_row(key, k_f16, head_dim * kv_size * num_heads);
     ggml_fp32_to_fp16_row(value, v_f16, head_dim * kv_size * num_heads);
+    ggml_fp32_to_fp16_row(mask, m_f16, GGML_PAD(batch_size, GGML_KQ_MASK_PAD) * kv_size);
 
     ggml_backend_tensor_set(model.q, query, 0, ggml_nbytes(model.q));
     ggml_backend_tensor_set(model.k, k_f16, 0, ggml_nbytes(model.k));
     ggml_backend_tensor_set(model.v, v_f16, 0, ggml_nbytes(model.v));
-    ggml_backend_tensor_set(model.msk, mask, 0, ggml_nbytes(model.msk));
+    ggml_backend_tensor_set(model.msk, m_f16, 0, ggml_nbytes(model.msk));
 }
 
 struct ggml_cgraph * build_graph(const test_model& model, struct ggml_allocr * allocr) {
@@ -201,12 +203,11 @@ struct ggml_cgraph * build_graph(const test_model& model, struct ggml_allocr * a
     struct ggml_cgraph  * gf = ggml_new_graph(ctx0);
 
     if(!model.naive_attn) {
-        struct ggml_tensor* result = ggml_flash_attn_ext(ctx0, model.q, model.k, model.v, nullptr, 1.0f / sqrtf(model.q->ne[0]));
+        struct ggml_tensor* result = ggml_flash_attn_ext(ctx0, model.q, model.k, model.v, model.msk, 1.0f / sqrtf(model.q->ne[0]));
         ggml_build_forward_expand(gf, result);
     } else {
         struct ggml_tensor* kq = ggml_mul_mat(ctx0, model.k, model.q);
-        kq = ggml_scale_inplace(ctx0, kq, 1.0f / sqrtf((float)model.q->ne[0]));
-        kq = ggml_soft_max(ctx0, kq);
+        kq = ggml_soft_max_ext(ctx0, kq, model.msk, 1.0f / sqrtf(model.q->ne[0]));
         kq = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, model.v)), kq);
         kq = ggml_permute     (ctx0, kq, 0, 2, 1, 3);
         //kq = ggml_cont_2d     (ctx0, kq, model.q->ne[0] * model.q->ne[2], model.q->ne[1]);
@@ -226,7 +227,7 @@ struct ggml_tensor* compute_graph(const test_model & model, ggml_backend_t backe
 
     // allocate tensors
     ggml_allocr_alloc_graph(allocr, gf);
-    int n_threads = 1;
+    int n_threads = 6;
 
     if (ggml_backend_is_cpu(model.backend)) {
         ggml_backend_cpu_set_n_threads(model.backend, n_threads);
@@ -335,7 +336,8 @@ int main(int argc, char ** argv)
 
     ggml_time_init();
 
-    load_model(model, 16, 32, 128, 2);
+    //load_model(model, 16, 32, 128, 2);
+    load_model(model, 64, 2048, 4096, 32);
 
     ggml_backend_buffer_t buf_compute; // for compute
     struct ggml_allocr * allocr = NULL;
@@ -361,15 +363,16 @@ int main(int argc, char ** argv)
         ggml_backend_synchronize(model.backend);
         printf("computing time: %.4f ms\n", (ggml_time_us() - compute_time_us__) / 1000.0);
         float* data = new float[ggml_nelements(result)];
-
         ggml_backend_tensor_get(result, data, 0, ggml_nbytes(result));
-        printf("\nPerforming test:\n");
+        printf("\nPerforming test (%zu):\n", ggml_nelements(result));
 
-        for(int i = 0; i < ggml_nelements(result); i ++) {
-            if(i > 0 && (i % result->ne[0] == 0)) {
+        int elements = ggml_nelements(result) > 1024 ? 1024 : ggml_nelements(result);
+
+        for(int i = 0; i < elements; i ++) {
+            if(i > 0 && (i % 16 == 0)) {
                 printf("\n");
             }
-            if(i > 0 && (i % (result->ne[0] * result->ne[2]) == 0)) {
+            if(i > 0 && (i % (16 * 32) == 0)) {
                 printf("\n\n");
             }
             printf("%2.4f ", data[i]);

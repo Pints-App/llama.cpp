@@ -10891,33 +10891,34 @@ inline void ggml_cuda_flash_attn(const ggml_tensor * Q, const ggml_tensor * K, c
 }
 
 
-inline void ggml_cuda_flash_attn_ext(const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V, const ggml_tensor * mask, ggml_tensor * KQV) {
-    GGML_ASSERT(Q->type == GGML_TYPE_F32);
-    GGML_ASSERT(K->type == GGML_TYPE_F16);
-    GGML_ASSERT(V->type == GGML_TYPE_F16);
-    GGML_ASSERT(KQV->type == GGML_TYPE_F32);
+inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F16);
+    GGML_ASSERT(src2->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
-    GGML_ASSERT(Q->backend == GGML_BACKEND_GPU);
-    GGML_ASSERT(K->backend == GGML_BACKEND_GPU);
-    GGML_ASSERT(V->backend == GGML_BACKEND_GPU);
-    GGML_ASSERT(KQV->backend == GGML_BACKEND_GPU);
+    GGML_ASSERT(src0->backend == GGML_BACKEND_GPU);
+    GGML_ASSERT(src1->backend == GGML_BACKEND_GPU);
+    GGML_ASSERT(src2->backend == GGML_BACKEND_GPU);
+    GGML_ASSERT(dst->backend == GGML_BACKEND_GPU);
 
-    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
-    GGML_ASSERT(!mask || mask->backend == GGML_BACKEND_GPU);
-    GGML_ASSERT(!mask || mask->ne[1] >= GGML_PAD(Q->ne[1], 16) &&
+    GGML_ASSERT(!src3 || src3->type == GGML_TYPE_F16);
+    GGML_ASSERT(!src3 || src3->backend == GGML_BACKEND_GPU);
+    GGML_ASSERT(!src3 || src3->ne[1] >= GGML_PAD(ne01, 16) &&
                                 "the Flash-Attention CUDA kernel requires the mask to be padded to 16 and at least n_queries big");
 
     ggml_cuda_set_device(g_main_device);
     const cudaStream_t main_stream = g_cudaStreams[g_main_device][0];
 
-    ggml_tensor_extra_gpu * src0_extra = (ggml_tensor_extra_gpu *) Q->extra;
-    ggml_tensor_extra_gpu * src1_extra = (ggml_tensor_extra_gpu *) K->extra;
-    ggml_tensor_extra_gpu * src2_extra = (ggml_tensor_extra_gpu *) V->extra;
-    ggml_tensor_extra_gpu * src3_extra = mask ? (ggml_tensor_extra_gpu *) mask->extra : nullptr;
-    ggml_tensor_extra_gpu * dst_extra  = (ggml_tensor_extra_gpu *) KQV->extra;
+    const char * query_data = (const char *) ((ggml_tensor_extra_gpu *) src0->extra)->data_device[g_main_device];
+    const char * key_data   = (const char *) ((ggml_tensor_extra_gpu *) src1->extra)->data_device[g_main_device];
+    const char * value_data = (const char *) ((ggml_tensor_extra_gpu *) src2->extra)->data_device[g_main_device];
+    const char * mask_data  = src3 ? (const char *) ((ggml_tensor_extra_gpu *) src3->extra)->data_device[g_main_device] : nullptr;
+    float * qkv_data        = (float *) ((ggml_tensor_extra_gpu *) dst->extra)->data_device[g_main_device];
 
     float scale;
-    memcpy(&scale, KQV->op_params, sizeof(float));
+    memcpy(&scale, dst->op_params, sizeof(float));
 
 #define NQPB 16
 #define NCPW 128
@@ -10927,81 +10928,45 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * Q, const ggml_tensor * 
 
     const int nwarps_max = 8; // TODO: we don't want to launch too much warps. how much is too much?
                               // TODO: produces wrong results for nwarps > 8 (RTX 2060) - not sure why
-    const int nwarps = Q->ne[1] <= nqpb ? MAX(2, MIN(K->ne[1]/ncpw, nwarps_max)) : 2;
+    const int nwarps = ne01 <= nqpb ? MAX(2, MIN(ne11/ncpw, nwarps_max)) : 2;
 
-    dim3 blocks_num((Q->ne[1] + nqpb - 1) / nqpb, Q->ne[2], Q->ne[3]);
+    dim3 blocks_num((ne01 + nqpb - 1) / nqpb, ne02, ne03);
     dim3 block_dim(32, nwarps, 1);
 
-    const size_t shmem = nqpb*(Q->ne[0] + nwarps*(ncpw + nqpb))*(sizeof(float)/2);
+    const size_t shmem = nqpb*(ne00 + nwarps*(ncpw + nqpb))*(sizeof(float)/2);
 
-    switch (Q->ne[0])
+    switch (ne00)
     {
     case 16:
         flash_attn_ext_f16<16, NQPB, NCPW>
             <<<blocks_num, block_dim, shmem, main_stream>>> (
-            (const char *) src0_extra->data_device[g_main_device], // Query
-            (const char *) src1_extra->data_device[g_main_device], // Key
-            (const char *) src2_extra->data_device[g_main_device], // Value
-            mask ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
-            (float *) dst_extra->data_device[g_main_device], // dst
-            scale,
-            Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
-            K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-            mask ? mask->ne[1] : 0, mask ?  mask->nb[1] : 0,
-            Q->nb[1], Q->nb[2], Q->nb[3],
-            K->nb[1], K->nb[2], K->nb[3],
-            KQV->ne[0], KQV->ne[1], KQV->ne[2], KQV->ne[3]
+                query_data, key_data, value_data, mask_data, qkv_data, scale,
+                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, src3->ne[1],
+                src3->nb[1], nb01, nb02, nb03, nb11, nb12, nb13, ne0, ne1, ne2, ne3
         );
         break;
     case 64:
         flash_attn_ext_f16<64, NQPB, NCPW>
             <<<blocks_num, block_dim, shmem, main_stream>>> (
-            (const char *) src0_extra->data_device[g_main_device], // Query
-            (const char *) src1_extra->data_device[g_main_device], // Key
-            (const char *) src2_extra->data_device[g_main_device], // Value
-            mask ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
-            (float *) dst_extra->data_device[g_main_device], // dst
-            scale,
-            Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
-            K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-            mask ? mask->ne[1] : 0, mask ?  mask->nb[1] : 0,
-            Q->nb[1], Q->nb[2], Q->nb[3],
-            K->nb[1], K->nb[2], K->nb[3],
-            KQV->ne[0], KQV->ne[1], KQV->ne[2], KQV->ne[3]
+                query_data, key_data, value_data, mask_data, qkv_data, scale,
+                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, src3->ne[1],
+                src3->nb[1], nb01, nb02, nb03, nb11, nb12, nb13, ne0, ne1, ne2, ne3
         );
         break;
     case 80:
         flash_attn_ext_f16<80, NQPB, NCPW>
             <<<blocks_num, block_dim, shmem, main_stream>>> (
-            (const char *) src0_extra->data_device[g_main_device], // Query
-            (const char *) src1_extra->data_device[g_main_device], // Key
-            (const char *) src2_extra->data_device[g_main_device], // Value
-            mask ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
-            (float *) dst_extra->data_device[g_main_device], // dst
-            scale,
-            Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
-            K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-            mask ? mask->ne[1] : 0, mask ?  mask->nb[1] : 0,
-            Q->nb[1], Q->nb[2], Q->nb[3],
-            K->nb[1], K->nb[2], K->nb[3],
-            KQV->ne[0], KQV->ne[1], KQV->ne[2], KQV->ne[3]
+                query_data, key_data, value_data, mask_data, qkv_data, scale,
+                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, src3->ne[1],
+                src3->nb[1], nb01, nb02, nb03, nb11, nb12, nb13, ne0, ne1, ne2, ne3
         );
         break;
     case 128:
         flash_attn_ext_f16<128, NQPB, NCPW>
             <<<blocks_num, block_dim, shmem, main_stream>>> (
-            (const char *) src0_extra->data_device[g_main_device], // Query
-            (const char *) src1_extra->data_device[g_main_device], // Key
-            (const char *) src2_extra->data_device[g_main_device], // Value
-            mask ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
-            (float *) dst_extra->data_device[g_main_device], // dst
-            scale,
-            Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
-            K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-            mask ? mask->ne[1] : 0, mask ?  mask->nb[1] : 0,
-            Q->nb[1], Q->nb[2], Q->nb[3],
-            K->nb[1], K->nb[2], K->nb[3],
-            KQV->ne[0], KQV->ne[1], KQV->ne[2], KQV->ne[3]
+                query_data, key_data, value_data, mask_data, qkv_data, scale,
+                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, src3->ne[1],
+                src3->nb[1], nb01, nb02, nb03, nb11, nb12, nb13, ne0, ne1, ne2, ne3
         );
         break;
     default:
