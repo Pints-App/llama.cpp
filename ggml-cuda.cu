@@ -6418,7 +6418,7 @@ static __global__ void flash_attn_ext_f16(
         const char* __restrict__ v,
         const char* __restrict__ mask,
         float* __restrict__ dst,
-        float scale,
+        half scale,
         int ne00,
         int ne01,
         int ne02,
@@ -6448,29 +6448,43 @@ static __global__ void flash_attn_ext_f16(
     const int iq2 = blockIdx.y;
     const int iq1 = blockIdx.x * Q;
 
-    const int D2 = D/2;
+    const int D2  = D/2;
     const int D16 = D/16;
     const int Q16 = Q/16;
-    const int NW = WARP_SIZE;
-    const int SH = (C + Q); // shared memory per simdgroup in (half)
+    const int NW  = WARP_SIZE;
+    const int SH  = (C + Q); // shared memory per simdgroup in (half)
 
     const int T  = D + num_warps*SH; // shared memory size per query in (half)
     const int T2 = T/2;              // shared memory size per query in (half2)
+    const int C2 = C/2;
 
     extern __shared__  half __flash_attn_f16_shmem[];
     // pq
     half  * sq  = (half  *) (__flash_attn_f16_shmem +              0*D); // holds the query data
     half2 * sq2 = (half2 *) (__flash_attn_f16_shmem +              0*D); // same as above but in half2
     half  * ss  = (half  *) (__flash_attn_f16_shmem + warp_id*SH + 1*D); // scratch buffer for attention and diagonal matrix
+    half2 * ss2 = (half2 *) (__flash_attn_f16_shmem + warp_id*SH + 1*D); // same as above but in half2
 
     half16x16_acc zr;
     half16x16_acc lo[Q16][D16];
 
     // load heads from Q to shared memory
-    for (int64_t j = warp_id; j < Q; j += num_warps) {
+#pragma unroll
+    for (int j0 = 0; j0 < Q; j0 += num_warps) {
+        const int j = j0 + warp_id;
+        if (j >= Q) {
+            break;
+        }
+
         const float2 * q2 = (const float2 *) (q + ((iq1 + j)*nb01 + iq2*nb02 + iq3*nb03));
 
-        for (int64_t i = lane_id; i < D2; i += NW) {
+#pragma unroll
+        for (int i0 = 0; i0 < D2; i0 += NW) {
+            const int i = i0 + lane_id;
+            if (i >= D2) {
+                break;
+            }
+
             if (iq1 + j < ne01) {
                 sq2[j*T2 + i] = __float22half2_rn(q2[i]);
             } else {
@@ -6482,15 +6496,20 @@ static __global__ void flash_attn_ext_f16(
     nvcuda::wmma::fill_fragment(zr, 0.0);
 
     // zero out lo
-    for (int64_t j = 0; j < Q16; ++j) {
-        for (int64_t i = 0; i < D16; ++i) {
+    for (int j = 0; j < Q16; ++j) {
+        for (int i = 0; i < D16; ++i) {
             nvcuda::wmma::fill_fragment(lo[j][i], 0.0);
         }
     }
 
     // zero out shared memory SH
-    for (int64_t j = 0; j < Q; ++j) {
-        for (int64_t i = lane_id; i < SH; i += NW) {
+    for (int j = 0; j < Q; ++j) {
+        for (int i0 = 0; i0 < SH; i0 += NW) {
+            const int i = i0 + lane_id;
+            if (i >= SH) {
+                break;
+            }
+
             ss[j*T + i] = 0.0;
         }
     }
@@ -6501,7 +6520,7 @@ static __global__ void flash_attn_ext_f16(
         half S[Q];
         half M[Q];
 
-        for(int i = 0; i < Q; i++) {
+        for (int i = 0; i < Q; ++i) {
             S[i] = __float2half(0.0f);
             M[i] = __float2half(-INFINITY);
         }
@@ -6531,8 +6550,8 @@ static __global__ void flash_attn_ext_f16(
 
         // load the queries from shared memory into local memory
         half16x16_a mq[Q16][D16];
-        for (int64_t j = 0; j < Q16; ++j) {
-            for (int64_t i = 0; i < D16; ++i) {
+        for (int j = 0; j < Q16; ++j) {
+            for (int i = 0; i < D16; ++i) {
                 nvcuda::wmma::load_matrix_sync(mq[j][i], sq + 16*j*T + i*16, T);
             }
         }
@@ -6543,37 +6562,43 @@ static __global__ void flash_attn_ext_f16(
         // prepare diagonal scale matrix
         half16x16_b mscale;
         for (int i = 0; i < 16; ++i) {
-            ss[i*T + i] = __float2half(scale);
+            ss[i*T + i] = scale;
         }
         nvcuda::wmma::load_matrix_sync(mscale, ss, T);
 
         // loop over the KV cache
         // each simdgroup handles blocks of Q rows and C columns
-        for (int64_t ic = C*warp_id; ic < ne11; ic += C*num_warps) {
+        for (int ic0 = 0; ic0 < ne11; ic0 += C*num_warps) {
+            const int ic = ic0 + warp_id*C;
+            if (ic >= ne11) {
+                break;
+            }
+
             // Q*K^T
             {
                 for (int cc = 0; cc < C/16; ++cc) {
                     half16x16_acc mqk[Q16];
-                    for (int64_t j = 0; j < Q16; ++j) {
+                    for (int j = 0; j < Q16; ++j) {
                         nvcuda::wmma::fill_fragment(mqk[j], 0);
                     }
 
                     const half * pk = (const half *) ((const char *) k + ((ic + 16*cc)*nb11 + ik2*nb12 + ik3*nb13));
 
-                    for (int64_t i = 0; i < D16; ++i) {
+                    for (int i = 0; i < D16; ++i) {
                         half16x16_bT mk; // transposed key
                         nvcuda::wmma::load_matrix_sync(mk, pk + i*16, nb11/sizeof(half));
 
-                        for (int64_t j = 0; j < Q16; ++j) {
+                        for (int j = 0; j < Q16; ++j) {
                             nvcuda::wmma::mma_sync(mqk[j], mq[j][i], mk, mqk[j]);
                         }
                     }
 
                     // mqk = mqk*scale + mask
-                    for (int64_t j = 0; j < Q16; ++j) {
+                    for (int j = 0; j < Q16; ++j) {
                         half16x16_a mqka;
                         half16x16_acc mm;
-                        if(mp) {
+
+                        if (mp) {
                             nvcuda::wmma::load_matrix_sync(mm, mp + 16*j*(nb31/sizeof(half)) + ic + 16*cc, nb31/sizeof(half), nvcuda::wmma::mem_row_major);
                         }
 
@@ -6588,90 +6613,72 @@ static __global__ void flash_attn_ext_f16(
             }
 
             // used to detect blocks full of -INF
-            half smax = __float2half(-INFINITY);
+            half2 smax = make_half2(-INFINITY, -INFINITY);
 
             // online softmax
-            if (C == 32) {
-                for (int64_t j = 0; j < Q; ++j) {
-                    const int64_t p = lane_id;
+            for (int j = 0; j < Q; ++j) {
+                const half m = M[j];
 
-                    const half m = M[j];
-                    const half s = ss[j*T + p];
+                for (int p0 = 0; p0 < C2; p0 += NW) {
+                    const int p = p0 + lane_id;
 
-                    smax = warp_reduce_max(__hmax(smax, s));
-                    M[j] = warp_reduce_max(__hmax(M[j], s));
+                    const half2 s = ss2[j*T2 + p];
 
-                    const half ms = __hisinf(m) == -1 ? __float2half(0.0f) : hexp(m - M[j]);
-                    const half vs = __hisinf(s) == -1 ? __float2half(0.0f) : hexp(s - M[j]);
+                    smax = __hmax2(smax, s);
+                    M[j] = __hmax(M[j], __hmax(s.x, s.y));
+                }
 
-                    S[j] = S[j]*ms + warp_reduce_sum(vs);
+                M[j] = warp_reduce_max(M[j]);
 
-                    // create a QxQ diagonal matrix for rescaling the output
-                    if (p == j) {
-                        ss[j*T + C + j] = ms;
-                    }
+                const half ms = hexp(m - M[j]);
+
+                // create a QxQ diagonal matrix for rescaling the output
+                if (lane_id == j) {
+                    ss[j*T + C + j] = ms;
+                }
+
+                // local sum
+                half2 ls = make_half2(0.0f, 0.0f);
+                half2 M2 = make_half2(M[j], M[j]);
+
+                for (int p0 = 0; p0 < C2; p0 += NW) {
+                    const int p = p0 + lane_id;
+
+                    const half2 s = ss2[j*T2 + p];
+
+                    const half2 vs = h2exp(s - M2);
+
+                    ls += vs;
 
                     // the P matrix from the paper (Q rows, C columns)
-                    ss[j*T + p] = vs;
+                    ss2[j*T2 + p] = vs;
                 }
-            } else {
-                for (int64_t j = 0; j < Q; ++j) {
-                    const half m = M[j];
 
-                    for (int64_t p = lane_id; p < C; p += NW) {
-                        const half s = ss[j*T + p];
+                ls = warp_reduce_sum(ls);
 
-                        smax = __hmax(smax, s);
-                        M[j] = __hmax(M[j], s);
-                    }
-
-                    smax = warp_reduce_max(smax);
-                    M[j] = warp_reduce_max(M[j]);
-
-                    const half ms = __hisinf(m) == -1 ? __float2half(0.0f) : hexp(m - M[j]);
-
-                    // create a QxQ diagonal matrix for rescaling the output
-                    if (lane_id == j) {
-                        ss[j*T + C + j] = ms;
-                    }
-
-                    // local sum
-                    half ls = 0.0f;
-
-                    for (int64_t p = lane_id; p < C; p += NW) {
-                        const half s = ss[j*T + p];
-
-                        const half vs = __hisinf(s) == -1 ? __float2half(0.0f) : hexp(s - M[j]);
-
-                        ls += vs;
-
-                        // the P matrix from the paper (Q rows, C columns)
-                        ss[j*T + p] = vs;
-                    }
-
-                    S[j] = S[j]*ms + warp_reduce_sum(ls);
-                }
+                S[j] = S[j]*ms + ls.x + ls.y;
             }
 
+            smax = warp_reduce_max(smax);
+
             // skip -INF blocks
-            if (__hisinf(smax) == -1) {
+            if (__hisinf(smax.x) == -1 || __hisinf(smax.y) == -1) {
                 continue;
             }
 
             // O = diag(ms)*O
-            for (int64_t j = 0; j < Q16; ++j) {
+            for (int j = 0; j < Q16; ++j) {
                 half16x16_a mm;
                 half16x16_b lob;
 
                 nvcuda::wmma::load_matrix_sync(mm, ss + 16*j*T + C + 16*j, T);
 
-                for (int64_t i = 0; i < D16; ++i) {
+                for (int i = 0; i < D16; ++i) {
                     // convert accumulator to matrix_b
                     nvcuda::wmma::store_matrix_sync(     ss + 16*j*T + C + 16*j, lo[j][i], T, nvcuda::wmma::mem_row_major);
                     nvcuda::wmma::load_matrix_sync (lob, ss + 16*j*T + C + 16*j, T);
 
-                    nvcuda::wmma::fill_fragment(lo[j][i], 0.0);
-                    nvcuda::wmma::mma_sync(lo[j][i], mm, lob, lo[j][i]);
+                    nvcuda::wmma::mma_sync(lo[j][i], mm, lob, zr);
                 }
 
                 // restore zeros
@@ -6684,17 +6691,17 @@ static __global__ void flash_attn_ext_f16(
                     const half * pv = (const half *) ((const char *) v + ((ic + 16*cc)*nb21 + iv2*nb22 + iv3*nb23));
 
                     half16x16_b mk[D16];
-                    for (int64_t i = 0; i < D16; ++i) {
+                    for (int i = 0; i < D16; ++i) {
                         nvcuda::wmma::load_matrix_sync(mk[i], pv + i*16, nb21/sizeof(half));
                     }
 
                     half16x16_a mv[Q16];
-                    for (int64_t j = 0; j < Q16; ++j) {
+                    for (int j = 0; j < Q16; ++j) {
                         nvcuda::wmma::load_matrix_sync(mv[j], ss + 16*j*T + 16*cc, T);
                     }
 
-                    for (int64_t j = 0; j < Q16; ++j) {
-                        for (int64_t i = 0; i < D16; ++i) {
+                    for (int j = 0; j < Q16; ++j) {
+                        for (int i = 0; i < D16; ++i) {
                             nvcuda::wmma::mma_sync(lo[j][i], mv[j], mk[i], lo[j][i]);
                         }
                     }
@@ -6703,7 +6710,7 @@ static __global__ void flash_attn_ext_f16(
         }
 
         // these are needed for reducing the results from the simdgroups (reuse the ss buffer)
-        for (int64_t j = 0; j < Q; ++j) {
+        for (int j = 0; j < Q; ++j) {
             if (lane_id == 0) {
                 ss[j*T + 0] = S[j];
                 ss[j*T + 1] = M[j];
@@ -6712,16 +6719,13 @@ static __global__ void flash_attn_ext_f16(
     }
 
     // reduce the warps sequentially
-    for (int64_t sg = 1; sg < num_warps; ++sg) {
-        half S = __float2half(0.0f);
-        half M = __float2half(-INFINITY);
-
+    for (int sg = 1; sg < num_warps; ++sg) {
         __syncthreads();
 
         // each simdgroup stores its output to shared memory, reusing sq
         if (warp_id == sg) {
-            for (int64_t j = 0; j < Q16; ++j) {
-                for (int64_t i = 0; i < D16; ++i) {
+            for (int j = 0; j < Q16; ++j) {
+                for (int i = 0; i < D16; ++i) {
                     nvcuda::wmma::store_matrix_sync(sq + 16*j*T + i*16, lo[j][i], T, nvcuda::wmma::mem_row_major);
                 }
             }
@@ -6731,31 +6735,29 @@ static __global__ void flash_attn_ext_f16(
 
         // the first simdgroup accumulates the results from the other simdgroups
         if (warp_id == 0) {
-            for (int64_t j = 0; j < Q; ++j) {
+            for (int j = lane_id; j < Q; j += NW) {
                 const half S0 = ss[j*T +         0];
                 const half S1 = ss[j*T + sg*SH + 0];
 
                 const half M0 = ss[j*T +         1];
                 const half M1 = ss[j*T + sg*SH + 1];
 
-                M = __hmax(M0, M1);
+                const half M = __hmax(M0, M1);
 
-                const half ms0 = __hisinf(M0) == -1 ? __float2half(0.0f) : hexp(M0 - M);
-                const half ms1 = __hisinf(M1) == -1 ? __float2half(0.0f) : hexp(M1 - M);
+                const half ms0 = hexp(M0 - M);
+                const half ms1 = hexp(M1 - M);
 
-                S = S0*ms0 + S1*ms1;
+                const half S = S0*ms0 + S1*ms1;
 
-                if (lane_id == 0) {
-                    ss[j*T + 0] = S;
-                    ss[j*T + 1] = M;
+                ss[j*T + 0] = S;
+                ss[j*T + 1] = M;
 
-                    ss[j*T + C + j        ] = ms0;
-                    ss[j*T + C + j + sg*SH] = ms1;
-                }
+                ss[j*T + C + j        ] = ms0;
+                ss[j*T + C + j + sg*SH] = ms1;
             }
 
             // O_0 = diag(ms0)*O_0 + diag(ms1)*O_1
-            for (int64_t j = 0; j < Q16; ++j) {
+            for (int j = 0; j < Q16; ++j) {
                 half16x16_a ms0;
                 half16x16_a ms1;
                 half16x16_b t;
@@ -6764,10 +6766,9 @@ static __global__ void flash_attn_ext_f16(
                 nvcuda::wmma::load_matrix_sync(ms0, ss + 16*j*T + C + 16*j,         T);
                 nvcuda::wmma::load_matrix_sync(ms1, ss + 16*j*T + C + 16*j + sg*SH, T);
 
-                for (int64_t i = 0; i < D16; ++i) {
-                    nvcuda::wmma::fill_fragment(t2, 0.0);
+                for (int i = 0; i < D16; ++i) {
                     nvcuda::wmma::load_matrix_sync(t, sq + 16*j*T + i*16, T);
-                    nvcuda::wmma::mma_sync(t2, ms1, t, t2);
+                    nvcuda::wmma::mma_sync(t2, ms1, t, zr);
 
                     // convert accumulator to matrix_b
                     nvcuda::wmma::store_matrix_sync(   sq + 16*j*T + i*16, lo[j][i], T, nvcuda::wmma::mem_row_major);
@@ -6781,8 +6782,8 @@ static __global__ void flash_attn_ext_f16(
 
     // store result to shared memory (reuse sq)
     if (warp_id == 0) {
-        for (int64_t j = 0; j < Q16; ++j) {
-            for (int64_t i = 0; i < D16; ++i) {
+        for (int j = 0; j < Q16; ++j) {
+            for (int i = 0; i < D16; ++i) {
                 nvcuda::wmma::store_matrix_sync(sq + 16*j*T + i*16, lo[j][i], T, nvcuda::wmma::mem_row_major);
             }
         }
@@ -6790,10 +6791,15 @@ static __global__ void flash_attn_ext_f16(
 
     // final rescale with 1/S and store to global memory
     if (warp_id == 0) {
-        for (int64_t j = 0; j < Q && iq1 + j < ne01; ++j) {
+        for (int j = 0; j < Q && iq1 + j < ne01; ++j) {
             const half S = ss[j*T + 0];
 
-            for (int64_t i = lane_id; i < D; i += NW) {
+            for (int i0 = 0; i0 < D; i0 += NW) {
+                const int i = i0 + lane_id;
+                if (i >= D) {
+                    break;
+                }
+
                 dst[(iq3*ne2*ne1 + iq2 + (iq1 + j)*ne1)*D + i] = __half2float(sq[j*T + i] / S);
             }
         }
@@ -10917,8 +10923,9 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
     const char * mask_data  = src3 ? (const char *) ((ggml_tensor_extra_gpu *) src3->extra)->data_device[g_main_device] : nullptr;
     float * qkv_data        = (float *) ((ggml_tensor_extra_gpu *) dst->extra)->data_device[g_main_device];
 
-    float scale;
-    memcpy(&scale, dst->op_params, sizeof(float));
+    float scale_;
+    memcpy(&scale_, dst->op_params, sizeof(float));
+    half scale = __float2half(scale_);
 
 #define NQPB 16
 #define NCPW 128
@@ -10926,9 +10933,11 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
     const int nqpb = NQPB; // queries per block
     const int ncpw = NCPW; // cache values per warp (does not work for other values)
 
+GGML_ASSERT(NQPB <= 32);
+
     const int nwarps_max = 8; // TODO: we don't want to launch too much warps. how much is too much?
                               // TODO: produces wrong results for nwarps > 8 (RTX 2060) - not sure why
-    const int nwarps = ne01 <= nqpb ? MAX(2, MIN(ne11/ncpw, nwarps_max)) : 2;
+    const int nwarps = ne01 <= nqpb ? MAX(2, MIN(ne11/ncpw, nwarps_max)) : 1;
 
     dim3 blocks_num((ne01 + nqpb - 1) / nqpb, ne02, ne03);
     dim3 block_dim(32, nwarps, 1);
@@ -10941,32 +10950,32 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
         flash_attn_ext_f16<16, NQPB, NCPW>
             <<<blocks_num, block_dim, shmem, main_stream>>> (
                 query_data, key_data, value_data, mask_data, qkv_data, scale,
-                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, src3->ne[1],
-                src3->nb[1], nb01, nb02, nb03, nb11, nb12, nb13, ne0, ne1, ne2, ne3
+                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, src3 ? src3->ne[1] : 0,
+                src3 ? src3->nb[1] : 0, nb01, nb02, nb03, nb11, nb12, nb13, ne0, ne1, ne2, ne3
         );
         break;
     case 64:
         flash_attn_ext_f16<64, NQPB, NCPW>
             <<<blocks_num, block_dim, shmem, main_stream>>> (
                 query_data, key_data, value_data, mask_data, qkv_data, scale,
-                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, src3->ne[1],
-                src3->nb[1], nb01, nb02, nb03, nb11, nb12, nb13, ne0, ne1, ne2, ne3
+                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, src3 ? src3->ne[1] : 0,
+                src3 ? src3->nb[1] : 0, nb01, nb02, nb03, nb11, nb12, nb13, ne0, ne1, ne2, ne3
         );
         break;
     case 80:
         flash_attn_ext_f16<80, NQPB, NCPW>
             <<<blocks_num, block_dim, shmem, main_stream>>> (
                 query_data, key_data, value_data, mask_data, qkv_data, scale,
-                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, src3->ne[1],
-                src3->nb[1], nb01, nb02, nb03, nb11, nb12, nb13, ne0, ne1, ne2, ne3
+                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, src3 ? src3->ne[1] : 0,
+                src3 ? src3->nb[1] : 0, nb01, nb02, nb03, nb11, nb12, nb13, ne0, ne1, ne2, ne3
         );
         break;
     case 128:
         flash_attn_ext_f16<128, NQPB, NCPW>
             <<<blocks_num, block_dim, shmem, main_stream>>> (
                 query_data, key_data, value_data, mask_data, qkv_data, scale,
-                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, src3->ne[1],
-                src3->nb[1], nb01, nb02, nb03, nb11, nb12, nb13, ne0, ne1, ne2, ne3
+                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, src3 ? src3->ne[1] : 0,
+                src3 ? src3->nb[1] : 0, nb01, nb02, nb03, nb11, nb12, nb13, ne0, ne1, ne2, ne3
         );
         break;
     default:

@@ -108,16 +108,19 @@ void load_model(test_model & model, int head_dim, int batch_size, int kv_size, i
     float* mask = new float[kv_size * GGML_PAD(batch_size, GGML_KQ_MASK_PAD)];
 
     for(int i = 0; i < head_dim*batch_size*num_heads;i ++) {
-        query[i] = i % 3 ? 2.0f : 1.5f;
+        float q = (1.0f * i) / (head_dim*batch_size*num_heads);
+        query[i] = q * 2.0f - 1.0f;
     }
 
     for(int i = 0; i < head_dim*kv_size*num_heads;i ++) {
-        key[i] = i % 3 ? 2.3f : 2.8f;
-        value[i] = i % 3 ? 3.5f : 1.5f;
+        float q = (1.0f * i) / (head_dim*kv_size*num_heads);
+        key[i] = -(q * 2.0f - 1.0f);
+        value[i] = (1.0f - q) * 2.0f - 1.0f;
     }
 
     for(int i = 0; i < GGML_PAD(batch_size, GGML_KQ_MASK_PAD)*kv_size;i ++) {
-        mask[i] = i % 3 ? 1.0f : 1.5f;
+        float q = (1.0f * i) / (GGML_PAD(batch_size, GGML_KQ_MASK_PAD)*kv_size);
+        mask[i] = q * 1.5f;
     }
 
     size_t buffer_size = 0;
@@ -159,10 +162,10 @@ void load_model(test_model & model, int head_dim, int batch_size, int kv_size, i
     model.ctx = ggml_init(params);
 
     // create tensors
-    model.q = ggml_new_tensor_3d(model.ctx, GGML_TYPE_F32, head_dim, batch_size, num_heads);
-    model.k = ggml_new_tensor_3d(model.ctx, GGML_TYPE_F16, head_dim, kv_size, num_heads);
-    model.v = ggml_new_tensor_3d(model.ctx, GGML_TYPE_F16, head_dim, kv_size, num_heads);
-    model.msk = ggml_new_tensor_2d(model.ctx, GGML_TYPE_F16, kv_size, GGML_PAD(batch_size, GGML_KQ_MASK_PAD));
+    model.q = ggml_new_tensor_4d(model.ctx, GGML_TYPE_F32, head_dim, batch_size, num_heads, 1);
+    model.k = ggml_new_tensor_4d(model.ctx, GGML_TYPE_F16, head_dim, kv_size, num_heads, 1);
+    model.v = ggml_new_tensor_4d(model.ctx, GGML_TYPE_F16, head_dim, kv_size, num_heads, 1);
+    model.msk = ggml_new_tensor_4d(model.ctx, GGML_TYPE_F16, kv_size, GGML_PAD(batch_size, GGML_KQ_MASK_PAD), 1, 1);
 
     // create a allocator
     ggml_allocr * alloc = ggml_allocr_new_from_buffer(model.buffer);
@@ -211,7 +214,7 @@ struct ggml_cgraph * build_graph(const test_model& model, struct ggml_allocr * a
         kq = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, model.v)), kq);
         kq = ggml_permute     (ctx0, kq, 0, 2, 1, 3);
         //kq = ggml_cont_2d     (ctx0, kq, model.q->ne[0] * model.q->ne[2], model.q->ne[1]);
-        ggml_build_forward_expand(gf, kq);
+        ggml_build_forward_expand(gf, ggml_cont(ctx0, kq));
     }
 
     // delete the temporally context used to build the graph
@@ -337,7 +340,7 @@ int main(int argc, char ** argv)
     ggml_time_init();
 
     //load_model(model, 16, 32, 128, 2);
-    load_model(model, 64, 2048, 4096, 32);
+    load_model(model, 64, 512, 128*128, 32);
 
     ggml_backend_buffer_t buf_compute; // for compute
     struct ggml_allocr * allocr = NULL;
