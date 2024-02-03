@@ -6568,16 +6568,12 @@ static __global__ void flash_attn_ext_f16(
 
         // loop over the KV cache
         // each simdgroup handles blocks of Q rows and C columns
-<<<<<<< HEAD
         for (int ic0 = 0; ic0 < ne11; ic0 += C*num_warps) {
             const int ic = ic0 + warp_id*C;
             if (ic >= ne11) {
                 break;
             }
 
-=======
-        for (int ic = C*warp_id; ic < ne11; ic += C*num_warps) {
->>>>>>> 8b51ab447b074dbabc007743613aa93e6a4c028e
             // Q*K^T
             {
                 for (int cc = 0; cc < C/16; ++cc) {
@@ -6620,14 +6616,8 @@ static __global__ void flash_attn_ext_f16(
             half2 smax = make_half2(-INFINITY, -INFINITY);
 
             // online softmax
-<<<<<<< HEAD
             for (int j = 0; j < Q; ++j) {
                 const half m = M[j];
-=======
-            if (C == 32) {
-                for (int j = 0; j < Q; ++j) {
-                    const int p = lane_id;
->>>>>>> 8b51ab447b074dbabc007743613aa93e6a4c028e
 
                 for (int p0 = 0; p0 < C2; p0 += NW) {
                     const int p = p0 + lane_id;
@@ -6663,50 +6653,10 @@ static __global__ void flash_attn_ext_f16(
                     // the P matrix from the paper (Q rows, C columns)
                     ss2[j*T2 + p] = vs;
                 }
-<<<<<<< HEAD
 
                 ls = warp_reduce_sum(ls);
 
                 S[j] = S[j]*ms + ls.x + ls.y;
-=======
-            } else {
-                for (int j = 0; j < Q; ++j) {
-                    const half m = M[j];
-
-                    for (int p = lane_id; p < C; p += NW) {
-                        const half s = ss[j*T + p];
-
-                        smax = __hmax(smax, s);
-                        M[j] = __hmax(M[j], s);
-                    }
-
-                    smax = warp_reduce_max(smax);
-                    M[j] = warp_reduce_max(M[j]);
-
-                    const half ms = __hisinf(m) == -1 ? __float2half(0.0f) : hexp(m - M[j]);
-
-                    // create a QxQ diagonal matrix for rescaling the output
-                    if (lane_id == j) {
-                        ss[j*T + C + j] = ms;
-                    }
-
-                    // local sum
-                    half ls = 0.0f;
-
-                    for (int p = lane_id; p < C; p += NW) {
-                        const half s = ss[j*T + p];
-
-                        const half vs = __hisinf(s) == -1 ? __float2half(0.0f) : hexp(s - M[j]);
-
-                        ls += vs;
-
-                        // the P matrix from the paper (Q rows, C columns)
-                        ss[j*T + p] = vs;
-                    }
-
-                    S[j] = S[j]*ms + warp_reduce_sum(ls);
-                }
->>>>>>> 8b51ab447b074dbabc007743613aa93e6a4c028e
             }
 
             smax = warp_reduce_max(smax);
@@ -6770,12 +6720,6 @@ static __global__ void flash_attn_ext_f16(
 
     // reduce the warps sequentially
     for (int sg = 1; sg < num_warps; ++sg) {
-<<<<<<< HEAD
-=======
-        half S = __float2half(0.0f);
-        half M = __float2half(-INFINITY);
-
->>>>>>> 8b51ab447b074dbabc007743613aa93e6a4c028e
         __syncthreads();
 
         // each simdgroup stores its output to shared memory, reusing sq
@@ -6791,11 +6735,7 @@ static __global__ void flash_attn_ext_f16(
 
         // the first simdgroup accumulates the results from the other simdgroups
         if (warp_id == 0) {
-<<<<<<< HEAD
             for (int j = lane_id; j < Q; j += NW) {
-=======
-            for (int j = 0; j < Q; ++j) {
->>>>>>> 8b51ab447b074dbabc007743613aa93e6a4c028e
                 const half S0 = ss[j*T +         0];
                 const half S1 = ss[j*T + sg*SH + 0];
 
@@ -6827,10 +6767,6 @@ static __global__ void flash_attn_ext_f16(
                 nvcuda::wmma::load_matrix_sync(ms1, ss + 16*j*T + C + 16*j + sg*SH, T);
 
                 for (int i = 0; i < D16; ++i) {
-<<<<<<< HEAD
-=======
-                    nvcuda::wmma::fill_fragment(t2, 0.0);
->>>>>>> 8b51ab447b074dbabc007743613aa93e6a4c028e
                     nvcuda::wmma::load_matrix_sync(t, sq + 16*j*T + i*16, T);
                     nvcuda::wmma::mma_sync(t2, ms1, t, zr);
 
@@ -6858,16 +6794,12 @@ static __global__ void flash_attn_ext_f16(
         for (int j = 0; j < Q && iq1 + j < ne01; ++j) {
             const half S = ss[j*T + 0];
 
-<<<<<<< HEAD
             for (int i0 = 0; i0 < D; i0 += NW) {
                 const int i = i0 + lane_id;
                 if (i >= D) {
                     break;
                 }
 
-=======
-            for (int i = lane_id; i < D; i += NW) {
->>>>>>> 8b51ab447b074dbabc007743613aa93e6a4c028e
                 dst[(iq3*ne2*ne1 + iq2 + (iq1 + j)*ne1)*D + i] = __half2float(sq[j*T + i] / S);
             }
         }
