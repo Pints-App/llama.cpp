@@ -19,6 +19,7 @@ extern "C" {
         const char *          (*GGML_CALL get_name)        (ggml_backend_buffer_type_t buft);
         ggml_backend_buffer_t (*GGML_CALL alloc_buffer)    (ggml_backend_buffer_type_t buft, size_t size);
         size_t                (*GGML_CALL get_alignment)   (ggml_backend_buffer_type_t buft); // tensor alignment
+        size_t                (*GGML_CALL get_max_size)    (ggml_backend_buffer_type_t buft); // allocation max size
         size_t                (*GGML_CALL get_alloc_size)  (ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor); // data size needed to allocate the tensor, including padding
         bool                  (*GGML_CALL supports_backend)(ggml_backend_buffer_type_t buft, ggml_backend_t backend); // check if the buffer type is usable by the backend
         // check if tensor data is in host memory
@@ -63,6 +64,11 @@ extern "C" {
     // do not use directly, use ggml_backend_tensor_copy instead
     bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst);
 
+    // buffer that contains a collection of buffers
+    GGML_CALL ggml_backend_buffer_t ggml_backend_multi_buffer_alloc_buffer(ggml_backend_buffer_t * buffers, size_t n_buffers);
+    GGML_CALL bool                  ggml_backend_buffer_is_multi_buffer(ggml_backend_buffer_t buffer);
+    GGML_CALL void                  ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
+
     //
     // Backend
     //
@@ -85,19 +91,22 @@ extern "C" {
         // (optional) complete all pending operations
         void (*GGML_CALL synchronize)(ggml_backend_t backend);
 
-        // compute graph with a plan
+        // create a plan for ggml_cgraph and free it
         ggml_backend_graph_plan_t (*GGML_CALL graph_plan_create) (ggml_backend_t backend, const struct ggml_cgraph * cgraph);
         void                      (*GGML_CALL graph_plan_free)   (ggml_backend_t backend, ggml_backend_graph_plan_t plan);
-        void                      (*GGML_CALL graph_plan_compute)(ggml_backend_t backend, ggml_backend_graph_plan_t plan);
 
+        // compute graph with a plan
+        enum ggml_status (*GGML_CALL graph_plan_compute)(ggml_backend_t backend, ggml_backend_graph_plan_t plan);
         // compute graph without a plan (async)
-        bool (*GGML_CALL graph_compute)(ggml_backend_t backend, struct ggml_cgraph * cgraph);
+        enum ggml_status (*GGML_CALL graph_compute)     (ggml_backend_t backend, struct ggml_cgraph * cgraph);
 
         // check if the backend supports an operation
         bool (*GGML_CALL supports_op)(ggml_backend_t backend, const struct ggml_tensor * op);
     };
 
     struct ggml_backend {
+        ggml_guid_t guid;
+
         struct ggml_backend_i iface;
 
         ggml_backend_context_t context;
