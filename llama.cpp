@@ -1,6 +1,6 @@
 #define LLAMA_API_INTERNAL
 #include "llama.h"
-
+#define GGML_FLASH_DECODING
 #include "unicode.h"
 
 #include "ggml.h"
@@ -5025,8 +5025,6 @@ static struct ggml_tensor * llm_build_kqv(
 
     GGML_ASSERT(kq_pos == nullptr && "ALiBi is not yet supported with Flash Attention");
 
-    bool flash_decoding = true;
-
     // split cached v into n_head heads (not transposed)
     struct ggml_tensor * v =
             ggml_view_3d(ctx, kv.v_l[il],
@@ -5035,11 +5033,14 @@ static struct ggml_tensor * llm_build_kqv(
                 ggml_row_size(kv.v_l[il]->type, n_embd_head_k),
                 0);
     cb(v, "v", il);
-
-    cur = ggml_flash_attn_ext(ctx, q, ggml_cont(ctx, k), ggml_cont(ctx,
-        flash_decoding && n_tokens == 1 ?
-        ggml_permute(ctx, v, 1, 0, 2, 3) : v), ggml_cont(ctx, kq_mask), kq_scale);
-
+#ifdef GGML_FLASH_DECODING
+    cur = ggml_flash_attn_ext(ctx, q,
+        n_tokens == 1 ? ggml_cont(ctx, k) : k,
+        n_tokens == 1 ? ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3)) : v,
+        ggml_cont(ctx, kq_mask), kq_scale);
+#else
+    cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale);
+#endif
     ggml_flash_attn_ext_set_prec(cur, GGML_PREC_DEFAULT);
     //printf("q: %4d %4d %4d %4d\n", q->ne[0], q->ne[1], q->ne[2], q->ne[3]);
     //printf("k: %4d %4d %4d %4d\n", k->ne[0], k->ne[1], k->ne[2], k->ne[3]);

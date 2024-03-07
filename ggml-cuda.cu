@@ -1,7 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml.h"
 #include "ggml-backend-impl.h"
-
+#define GGML_FLASH_DECODING
 #include <algorithm>
 #include <assert.h>
 #include <atomic>
@@ -7339,7 +7339,6 @@ static __global__ void flash_attn_ext_f16(
                 // create a QxQ diagonal matrix for rescaling the output
                 if (lane_id == j && !__hisnan(ms)) {
                     ss[j*T + C + j] = ms;
-
                     S = S*ms + ls.x + ls.y;
                 }
             }
@@ -11980,9 +11979,9 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
 #define NQPB 16
 #define NCPW 128
 
-    bool flash_decoding = true;
-
-    if(!flash_decoding || ne00 != 128 || ne01 > 1) {
+#ifdef GGML_FLASH_DECODING
+    if(ne00 != 128 || ne01 > 1) {
+#endif
         const int nqpb = NQPB; // queries per block
         const int ncpw = NCPW; // cache values per warp (does not work for other values)
 
@@ -12101,6 +12100,7 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
             default:
                 break;
         }
+#ifdef GGML_FLASH_DECODING
     } else {
 #define WMMA_M 16
 #define WMMA_N 16
@@ -12130,6 +12130,7 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
             (const half*)src1_extra->data_device[g_main_device],
             (float *)dst_extra->data_device[g_main_device], ne11, ne11 / kv_per_block, reduce_block);
     }
+#endif
 
     CUDA_CHECK(cudaGetLastError());
 }
