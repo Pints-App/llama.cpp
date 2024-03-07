@@ -8310,7 +8310,7 @@ static int llama_decode_internal(
         // after enough generations, the benefit from this heuristic disappears
         // if we start defragmenting the cache, the benefit from this will be more important
         // note: we pad the n_kv because certain GPU kernels require it (e.g. ggml_flash_attn_ext)
-        kv_self.n = std::min(cparams.n_ctx, std::max(128u, GGML_PAD(llama_kv_cache_cell_max(kv_self), 128)));
+        kv_self.n = std::min(cparams.n_ctx, std::max(256u, GGML_PAD(llama_kv_cache_cell_max(kv_self), 256u)));
         //kv_self.n = llama_kv_cache_cell_max(kv_self);
     }
 

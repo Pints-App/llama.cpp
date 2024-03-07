@@ -7317,6 +7317,11 @@ static __global__ void flash_attn_ext_f16(
                 for (int p0 = 0; p0 < C2; p0 += NW) {
                     const int p = p0 + lane_id;
 
+                    if(__hisinf(M[j]) == -1) {
+                        ss2[j*T2 + p] = ls;
+                        continue;
+                    }
+
                     const half2 s = ss2[j*T2 + p];
 
                     const half2 vs = h2exp(s - M2);
@@ -7332,7 +7337,7 @@ static __global__ void flash_attn_ext_f16(
                 const half ms = hexp(m - M[j]);
 
                 // create a QxQ diagonal matrix for rescaling the output
-                if (lane_id == j) {
+                if (lane_id == j && !__hisnan(ms)) {
                     ss[j*T + C + j] = ms;
 
                     S = S*ms + ls.x + ls.y;
