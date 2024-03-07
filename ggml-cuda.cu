@@ -7496,7 +7496,7 @@ static __global__ void flash_attn_ext_f16(
 
 template<int head_dim, int num_warps, int kv_tensor, int kv_block, int tensor_elements, int WMMA_M, int WMMA_N,int WMMA_K>
 __global__ void flash_attn_row(
-    const half* query,
+    const float* query,
     half* key /* reuse key buffer for partials result */,
     const half* value,
     const half* mask,
@@ -7518,7 +7518,7 @@ __global__ void flash_attn_row(
     const int HD2 = head_dim / 2;
 
     // load query with 128x2 shape (repeat row twice)
-    const half2* query_ = (const half2*)(query + head_dim*blockIdx.y); // shift as head
+    const float2* query_ = (const float2*)(query + head_dim*blockIdx.y); // shift as head
 #pragma unroll
     for (int j = 0; j < kv_tensor; j += num_warps) {
         const int q_off = j + warp_index;
@@ -7532,7 +7532,7 @@ __global__ void flash_attn_row(
             if (h_offset >= HD2) {
                 break;
             }
-            squery2[q_off*HD2 + h_offset] = query_[h_offset];
+            squery2[q_off*HD2 + h_offset] = __float22half2_rn(query_[h_offset]);
         }
     }
 
@@ -7546,7 +7546,6 @@ __global__ void flash_attn_row(
 
         const int kv_per_warp = kv_block / num_warps;
         const int sum_diag = WMMA_K / kv_tensor;
-        // assert(kv_per_warp % kv_tensor == 0);
 
         const int kvi = warp_index*kv_per_warp;
 
@@ -7590,9 +7589,11 @@ __global__ void flash_attn_row(
 
         float S = 0.0f;
 
-        for (int kv = lane_index*kv_tensor; kv < kv_per_warp; kv += WARP_SIZE*kv_tensor) {
-            S += expf(sscores[kvi + kv] - M);
-            S += expf(sscores[kvi + kv + 1] - M);
+        if(M != -INFINITY) {
+            for (int kv = lane_index*kv_tensor; kv < kv_per_warp; kv += WARP_SIZE*kv_tensor) {
+                S += expf(sscores[kvi + kv] - M);
+                S += expf(sscores[kvi + kv + 1] - M);
+            }
         }
 
         S = warp_reduce_sum(S);
@@ -11979,123 +11980,155 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
 #define NQPB 16
 #define NCPW 128
 
-    const int nqpb = NQPB; // queries per block
-    const int ncpw = NCPW; // cache values per warp (does not work for other values)
+    bool flash_decoding = true;
 
-    GGML_ASSERT(NQPB <= 32);
+    if(!flash_decoding || ne00 != 128 || ne01 > 1) {
+        const int nqpb = NQPB; // queries per block
+        const int ncpw = NCPW; // cache values per warp (does not work for other values)
 
-    const int nwarps_max = 8; // TODO: we don't want to launch too much warps. how much is too much?
-                              // TODO: produces wrong results for nwarps > 8 (RTX 2060) - not sure why
-    const int nwarps = ne01 <= nqpb ? std::max(2, std::min((int) ne11/ncpw, nwarps_max)) : 1;
+        GGML_ASSERT(NQPB <= 32);
 
-    dim3 blocks_num((ne01 + nqpb - 1) / nqpb, ne02, ne03);
-    dim3 block_dim(32, nwarps, 1);
+        const int nwarps_max = 8; // TODO: we don't want to launch too much warps. how much is too much?
+                                // TODO: produces wrong results for nwarps > 8 (RTX 2060) - not sure why
+        const int nwarps = ne01 <= nqpb ? std::max(2, std::min((int) ne11/ncpw, nwarps_max)) : 1;
 
-    const size_t shmem = nqpb*(ne00 + nwarps*(ncpw + nqpb))*(sizeof(float)/2);
+        dim3 blocks_num((ne01 + nqpb - 1) / nqpb, ne02, ne03);
+        dim3 block_dim(32, nwarps, 1);
 
-    // increase shared memory limit to 96KB
-    //const size_t shmem_max = 96*1024;
-    //cudaFuncSetAttribute(flash_attn_ext_f16<128, NQPB, NCPW>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_max);
+        const size_t shmem = nqpb*(ne00 + nwarps*(ncpw + nqpb))*(sizeof(float)/2);
 
-    switch (ne00) {
-        case 64:
-            flash_attn_ext_f16<64, NQPB, NCPW>
-                <<<blocks_num, block_dim, shmem, main_stream>>> (
-                        (const char *) src0_extra->data_device[g_main_device], // Query
-                        (const char *) src1_extra->data_device[g_main_device], // Key
-                        (const char *) src2_extra->data_device[g_main_device], // Value
-                        src3 ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
-                        (float *) dst_extra->data_device[g_main_device], // dst
-                        scale,
-                        ne00, ne01, ne02, ne03,
-                        ne10, ne11, ne12, ne13,
-                        src3 ? src3->ne[1] : 0, src3 ? src3->nb[1] : 0,
-                        nb01, nb02, nb03,
-                        nb11, nb12, nb13,
-                        ne0, ne1, ne2, ne3);
-            break;
-        case 80:
-            flash_attn_ext_f16<80, NQPB, NCPW>
-                <<<blocks_num, block_dim, shmem, main_stream>>> (
-                        (const char *) src0_extra->data_device[g_main_device], // Query
-                        (const char *) src1_extra->data_device[g_main_device], // Key
-                        (const char *) src2_extra->data_device[g_main_device], // Value
-                        src3 ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
-                        (float *) dst_extra->data_device[g_main_device], // dst
-                        scale,
-                        ne00, ne01, ne02, ne03,
-                        ne10, ne11, ne12, ne13,
-                        src3 ? src3->ne[1] : 0, src3 ? src3->nb[1] : 0,
-                        nb01, nb02, nb03,
-                        nb11, nb12, nb13,
-                        ne0, ne1, ne2, ne3);
-            break;
-        case 96:
-            flash_attn_ext_f16<96, NQPB, NCPW>
-                <<<blocks_num, block_dim, shmem, main_stream>>> (
-                        (const char *) src0_extra->data_device[g_main_device], // Query
-                        (const char *) src1_extra->data_device[g_main_device], // Key
-                        (const char *) src2_extra->data_device[g_main_device], // Value
-                        src3 ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
-                        (float *) dst_extra->data_device[g_main_device], // dst
-                        scale,
-                        ne00, ne01, ne02, ne03,
-                        ne10, ne11, ne12, ne13,
-                        src3 ? src3->ne[1] : 0, src3 ? src3->nb[1] : 0,
-                        nb01, nb02, nb03,
-                        nb11, nb12, nb13,
-                        ne0, ne1, ne2, ne3);
-            break;
-        case 112:
-            flash_attn_ext_f16<112, NQPB, NCPW>
-                <<<blocks_num, block_dim, shmem, main_stream>>> (
-                        (const char *) src0_extra->data_device[g_main_device], // Query
-                        (const char *) src1_extra->data_device[g_main_device], // Key
-                        (const char *) src2_extra->data_device[g_main_device], // Value
-                        src3 ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
-                        (float *) dst_extra->data_device[g_main_device], // dst
-                        scale,
-                        ne00, ne01, ne02, ne03,
-                        ne10, ne11, ne12, ne13,
-                        src3 ? src3->ne[1] : 0, src3 ? src3->nb[1] : 0,
-                        nb01, nb02, nb03,
-                        nb11, nb12, nb13,
-                        ne0, ne1, ne2, ne3);
-            break;
-        case 128:
-            flash_attn_ext_f16<128, NQPB, NCPW>
-                <<<blocks_num, block_dim, shmem, main_stream>>> (
-                        (const char *) src0_extra->data_device[g_main_device], // Query
-                        (const char *) src1_extra->data_device[g_main_device], // Key
-                        (const char *) src2_extra->data_device[g_main_device], // Value
-                        src3 ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
-                        (float *) dst_extra->data_device[g_main_device], // dst
-                        scale,
-                        ne00, ne01, ne02, ne03,
-                        ne10, ne11, ne12, ne13,
-                        src3 ? src3->ne[1] : 0, src3 ? src3->nb[1] : 0,
-                        nb01, nb02, nb03,
-                        nb11, nb12, nb13,
-                        ne0, ne1, ne2, ne3);
-            break;
-        case 256:
-            flash_attn_ext_f16<256, NQPB, NCPW>
-                <<<blocks_num, block_dim, shmem, main_stream>>> (
-                        (const char *) src0_extra->data_device[g_main_device], // Query
-                        (const char *) src1_extra->data_device[g_main_device], // Key
-                        (const char *) src2_extra->data_device[g_main_device], // Value
-                        src3 ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
-                        (float *) dst_extra->data_device[g_main_device], // dst
-                        scale,
-                        ne00, ne01, ne02, ne03,
-                        ne10, ne11, ne12, ne13,
-                        src3 ? src3->ne[1] : 0, src3 ? src3->nb[1] : 0,
-                        nb01, nb02, nb03,
-                        nb11, nb12, nb13,
-                        ne0, ne1, ne2, ne3);
-            break;
-        default:
-            break;
+        // increase shared memory limit to 96KB
+        //const size_t shmem_max = 96*1024;
+        //cudaFuncSetAttribute(flash_attn_ext_f16<128, NQPB, NCPW>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_max);
+
+        switch (ne00) {
+            case 64:
+                flash_attn_ext_f16<64, NQPB, NCPW>
+                    <<<blocks_num, block_dim, shmem, main_stream>>> (
+                            (const char *) src0_extra->data_device[g_main_device], // Query
+                            (const char *) src1_extra->data_device[g_main_device], // Key
+                            (const char *) src2_extra->data_device[g_main_device], // Value
+                            src3 ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
+                            (float *) dst_extra->data_device[g_main_device], // dst
+                            scale,
+                            ne00, ne01, ne02, ne03,
+                            ne10, ne11, ne12, ne13,
+                            src3 ? src3->ne[1] : 0, src3 ? src3->nb[1] : 0,
+                            nb01, nb02, nb03,
+                            nb11, nb12, nb13,
+                            ne0, ne1, ne2, ne3);
+                break;
+            case 80:
+                flash_attn_ext_f16<80, NQPB, NCPW>
+                    <<<blocks_num, block_dim, shmem, main_stream>>> (
+                            (const char *) src0_extra->data_device[g_main_device], // Query
+                            (const char *) src1_extra->data_device[g_main_device], // Key
+                            (const char *) src2_extra->data_device[g_main_device], // Value
+                            src3 ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
+                            (float *) dst_extra->data_device[g_main_device], // dst
+                            scale,
+                            ne00, ne01, ne02, ne03,
+                            ne10, ne11, ne12, ne13,
+                            src3 ? src3->ne[1] : 0, src3 ? src3->nb[1] : 0,
+                            nb01, nb02, nb03,
+                            nb11, nb12, nb13,
+                            ne0, ne1, ne2, ne3);
+                break;
+            case 96:
+                flash_attn_ext_f16<96, NQPB, NCPW>
+                    <<<blocks_num, block_dim, shmem, main_stream>>> (
+                            (const char *) src0_extra->data_device[g_main_device], // Query
+                            (const char *) src1_extra->data_device[g_main_device], // Key
+                            (const char *) src2_extra->data_device[g_main_device], // Value
+                            src3 ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
+                            (float *) dst_extra->data_device[g_main_device], // dst
+                            scale,
+                            ne00, ne01, ne02, ne03,
+                            ne10, ne11, ne12, ne13,
+                            src3 ? src3->ne[1] : 0, src3 ? src3->nb[1] : 0,
+                            nb01, nb02, nb03,
+                            nb11, nb12, nb13,
+                            ne0, ne1, ne2, ne3);
+                break;
+            case 112:
+                flash_attn_ext_f16<112, NQPB, NCPW>
+                    <<<blocks_num, block_dim, shmem, main_stream>>> (
+                            (const char *) src0_extra->data_device[g_main_device], // Query
+                            (const char *) src1_extra->data_device[g_main_device], // Key
+                            (const char *) src2_extra->data_device[g_main_device], // Value
+                            src3 ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
+                            (float *) dst_extra->data_device[g_main_device], // dst
+                            scale,
+                            ne00, ne01, ne02, ne03,
+                            ne10, ne11, ne12, ne13,
+                            src3 ? src3->ne[1] : 0, src3 ? src3->nb[1] : 0,
+                            nb01, nb02, nb03,
+                            nb11, nb12, nb13,
+                            ne0, ne1, ne2, ne3);
+                break;
+            case 128:
+                flash_attn_ext_f16<128, NQPB, NCPW>
+                    <<<blocks_num, block_dim, shmem, main_stream>>> (
+                            (const char *) src0_extra->data_device[g_main_device], // Query
+                            (const char *) src1_extra->data_device[g_main_device], // Key
+                            (const char *) src2_extra->data_device[g_main_device], // Value
+                            src3 ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
+                            (float *) dst_extra->data_device[g_main_device], // dst
+                            scale,
+                            ne00, ne01, ne02, ne03,
+                            ne10, ne11, ne12, ne13,
+                            src3 ? src3->ne[1] : 0, src3 ? src3->nb[1] : 0,
+                            nb01, nb02, nb03,
+                            nb11, nb12, nb13,
+                            ne0, ne1, ne2, ne3);
+                break;
+            case 256:
+                flash_attn_ext_f16<256, NQPB, NCPW>
+                    <<<blocks_num, block_dim, shmem, main_stream>>> (
+                            (const char *) src0_extra->data_device[g_main_device], // Query
+                            (const char *) src1_extra->data_device[g_main_device], // Key
+                            (const char *) src2_extra->data_device[g_main_device], // Value
+                            src3 ? ((const char *) src3_extra->data_device[g_main_device]) : nullptr, // Mask
+                            (float *) dst_extra->data_device[g_main_device], // dst
+                            scale,
+                            ne00, ne01, ne02, ne03,
+                            ne10, ne11, ne12, ne13,
+                            src3 ? src3->ne[1] : 0, src3 ? src3->nb[1] : 0,
+                            nb01, nb02, nb03,
+                            nb11, nb12, nb13,
+                            ne0, ne1, ne2, ne3);
+                break;
+            default:
+                break;
+        }
+    } else {
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
+#define TENSOR_ELEMENTS 256
+#define KV_BLOCK_SIZE 256
+
+        constexpr int num_warps = 8;
+        constexpr int kv_per_block = KV_BLOCK_SIZE;
+
+        // assert(kv_size % kv_per_block == 0);
+        dim3 grid_dim(ne11 / kv_per_block, ne02, 1);
+        dim3 block_dim(WARP_SIZE, num_warps, 1);
+
+        int shmem =
+            ne00*2*sizeof(half) /* query buffer */ +
+            (kv_per_block + 2)*sizeof(float) /* scores buffer */ +
+            num_warps * (TENSOR_ELEMENTS + 2) * sizeof(float) /* tensor core result buffer per warp */;
+
+        int reduce_block = ((grid_dim.x + WMMA_M - 1) / WMMA_M) * WMMA_N;
+        flash_attn_row<128, num_warps, 2, kv_per_block, TENSOR_ELEMENTS, WMMA_M, WMMA_N, WMMA_K><<<grid_dim, block_dim, shmem, main_stream>>>(
+            (const float*)src0_extra->data_device[g_main_device],
+            (half*)src1_extra->data_device[g_main_device],
+            (const half*)src2_extra->data_device[g_main_device],
+            (const half*)src3_extra->data_device[g_main_device], ne11, scale, reduce_block, ne10*ne11);
+        fa_reduce<128, num_warps, TENSOR_ELEMENTS><<<ne02, block_dim, shmem, main_stream>>>(
+            (const half*)src1_extra->data_device[g_main_device],
+            (float *)dst_extra->data_device[g_main_device], ne11, ne11 / kv_per_block, reduce_block);
     }
 
     CUDA_CHECK(cudaGetLastError());
