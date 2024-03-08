@@ -14520,6 +14520,24 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     }
 }
 
+static void print_tensor(const char* filename, const struct ggml_tensor* tensor, const char* name)
+{
+    printf("============== %s [%d, %d, %d, %d] =================\n", name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+    int ttype = (int)tensor->type;
+    for(int r = 0;r < (tensor->ne[1] > 1 ? 16 : 1); r ++) {
+        for(int c = 0;c < 16; c ++) {
+            if(ttype == GGML_TYPE_F32) {
+                printf("%0.5ff, ",((float*)tensor->data)[r * tensor->ne[0] + c]);
+            } else if(ttype == GGML_TYPE_F16) {
+                printf("%0.5ff, ", ggml_fp16_to_fp32(((ggml_fp16_t*)tensor->data)[r * tensor->ne[0] + c]));
+            }
+        }
+        printf("\n");
+    }
+}
+
+bool debug_kernel_ = true, debug_prompt_ = true;
+
 static void ggml_compute_forward_flash_attn_ext(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * q,
@@ -14537,6 +14555,24 @@ static void ggml_compute_forward_flash_attn_ext(
                 // TODO: implement F32 precision
                 GGML_ASSERT(false);
             } break;
+    }
+
+    if(q->ne[1] == 1 && debug_kernel_) {
+        printf("TOKEN GENERATION\n");
+        print_tensor("C:\\proyectos\\kernel-data\\tg\\fa-cuda-q-256.tensor", q, "Query data");
+        print_tensor("C:\\proyectos\\kernel-data\\tg\\fa-cuda-k-256.tensor", k, "Key data");
+        print_tensor("C:\\proyectos\\kernel-data\\tg\\fa-cuda-v-256.tensor", v, "Value data");
+        print_tensor("C:\\proyectos\\kernel-data\\tg\\fa-cuda-mask-256.tensor", mask, "Mask data");
+        print_tensor("C:\\proyectos\\kernel-data\\tg\\fa-cuda-qkv-256.tensor", dst, "QKV data");
+        debug_kernel_ = false;
+    } else if(q->ne[1] == 112 && debug_prompt_) {
+        printf("PROMPT PROCESSING\n");
+        print_tensor("C:\\proyectos\\kernel-data\\tg\\fa-cuda-q-256.tensor", q, "Query data");
+        print_tensor("C:\\proyectos\\kernel-data\\tg\\fa-cuda-k-256.tensor", k, "Key data");
+        print_tensor("C:\\proyectos\\kernel-data\\tg\\fa-cuda-v-256.tensor", v, "Value data");
+        print_tensor("C:\\proyectos\\kernel-data\\tg\\fa-cuda-mask-256.tensor", mask, "Mask data");
+        print_tensor("C:\\proyectos\\kernel-data\\tg\\fa-cuda-qkv-256.tensor", dst, "QKV data");
+        debug_prompt_ = false;
     }
 }
 

@@ -11944,14 +11944,14 @@ static void ggml_cuda_mul_mat_id(const ggml_tensor * src0, const ggml_tensor * s
     }
 }
 
-static void save_tensor_to_file(const char* filename, const ggml_tensor* tensor, const char* name, cudaStream_t stream)
+static void save_tensor_to_file(const char* filename, const ggml_tensor* tensor, const char* name)
 {
     // FILE* f = fopen(filename, "wb");
     // int len = strlen(name);
     // int n_dims = ggml_n_dims(tensor);
     // printf("writing '%s' - %d dimens\n", name, n_dims);
     // fwrite(&n_dims, sizeof(n_dims), 1, f);
-    printf("============== %s =================\n", name);
+    printf("============== %s [%d, %d, %d, %d] =================\n", name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
     int ttype = (int)tensor->type;
     // fwrite(&ttype, sizeof(ttype), 1, f);
     // for (int i = 0; i < n_dims; ++i) {
@@ -11963,8 +11963,8 @@ static void save_tensor_to_file(const char* filename, const ggml_tensor* tensor,
     void* data = malloc(ggml_nbytes(tensor));
     ggml_backend_tensor_get(tensor, data, 0, ggml_nbytes(tensor));
     // printf("[%d, %d] %zu\n", tensor->ne[0], tensor->ne[1], ggml_nbytes(tensor));
-    for(int r = 0;r < (tensor->ne[1] > 1 ? 10 : 1); r ++) {
-        for(int c = 0;c < 10; c ++) {
+    for(int r = 0;r < (tensor->ne[1] > 1 ? 16 : 1); r ++) {
+        for(int c = 0;c < 16; c ++) {
             if(ttype == GGML_TYPE_F32) {
                 printf("%0.5ff, ",((float*)data)[r * tensor->ne[0] + c]);
             } else if(ttype == GGML_TYPE_F16) {
@@ -11980,7 +11980,8 @@ static void save_tensor_to_file(const char* filename, const ggml_tensor* tensor,
     free(data);
     // fclose(f);
 }
-bool debug_kernel = true;
+
+bool debug_kernel = true, debug_prompt = true;
 
 inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
@@ -12138,6 +12139,23 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
             default:
                 break;
         }
+        if(ne01 == 1 && debug_kernel) {
+            printf("TOKEN GENERATION\n");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-q-256.tensor", src0, "Query data");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-k-256.tensor", src1, "Key data");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-v-256.tensor", src2, "Value data");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-mask-256.tensor", src3, "Mask data");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-qkv-256.tensor", dst, "QKV data");
+            debug_kernel = false;
+        } else if(ne01 == 112 && debug_prompt) {
+            printf("PROMPT PROCESSING\n");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-q-256.tensor", src0, "Query data");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-k-256.tensor", src1, "Key data");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-v-256.tensor", src2, "Value data");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-mask-256.tensor", src3, "Mask data");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-qkv-256.tensor", dst, "QKV data");
+            debug_prompt = false;
+        }
 #ifdef GGML_FLASH_DECODING
     } else {
 #define WMMA_M 16
@@ -12159,7 +12177,7 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
             num_warps * (TENSOR_ELEMENTS + 2) * sizeof(float) /* tensor core result buffer per warp */;
 
         if(ne01 == 1 && debug_kernel) {
-            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-k-256.tensor", src1, "Key data",   main_stream);
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-k-256.tensor", src1, "Key data");
         }
 
         int reduce_block = ((grid_dim.x + WMMA_M - 1) / WMMA_M) * WMMA_N;
@@ -12172,10 +12190,11 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
             (const half*)src1_extra->data_device[g_main_device],
             (float *)dst_extra->data_device[g_main_device], ne11, ne11 / kv_per_block, reduce_block);
         if(ne01 == 1 && debug_kernel) {
-            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-q-256.tensor", src0, "Query data", main_stream);
-            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-v-256.tensor", src2, "Value data", main_stream);
-            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-mask-256.tensor", src3, "Mask data", main_stream);
-            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-qkv-256.tensor", dst, "QKV data", main_stream);
+            printf("TOKEN GENERATION FLASH DECODING\n");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-q-256.tensor", src0, "Query data");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-v-256.tensor", src2, "Value data");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-mask-256.tensor", src3, "Mask data");
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-qkv-256.tensor", dst, "QKV data");
             debug_kernel = false;
         }
     }

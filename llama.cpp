@@ -5033,7 +5033,7 @@ static struct ggml_tensor * llm_build_kqv(
                 ggml_row_size(kv.v_l[il]->type, n_embd_head_k),
                 0);
     cb(v, "v", il);
-#ifdef GGML_FLASH_DECODING
+#if defined(GGML_FLASH_DECODING) && defined(GGML_USE_CUBLAS)
     cur = ggml_flash_attn_ext(ctx, q,
         n_tokens == 1 ? ggml_cont(ctx, k) : k,
         n_tokens == 1 ? ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3)) : v,
