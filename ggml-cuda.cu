@@ -7749,7 +7749,7 @@ __global__ void fa_reduce(const half* red_buf, float* qkv, int kv_size, int num_
             for(int kv = 1; kv < num_kv_blocks; kv++) {
                 hdim = hdim*__half2float(sscale[kv*2]) + __half2float(red_buf[head_offset + (hi + hdi) * reduce_block + kv]) * __half2float(sscale[kv*2 + 1]);
             }
-            qkv[blockIdx.x * head_dim + hi + lane_index] = hdim / sf_lse[0];
+            qkv[blockIdx.x * head_dim + hi + hdi] = hdim / sf_lse[0];
         }
     }
 }
@@ -11944,6 +11944,44 @@ static void ggml_cuda_mul_mat_id(const ggml_tensor * src0, const ggml_tensor * s
     }
 }
 
+static void save_tensor_to_file(const char* filename, const ggml_tensor* tensor, const char* name, cudaStream_t stream)
+{
+    // FILE* f = fopen(filename, "wb");
+    // int len = strlen(name);
+    // int n_dims = ggml_n_dims(tensor);
+    // printf("writing '%s' - %d dimens\n", name, n_dims);
+    // fwrite(&n_dims, sizeof(n_dims), 1, f);
+    printf("============== %s =================\n", name);
+    int ttype = (int)tensor->type;
+    // fwrite(&ttype, sizeof(ttype), 1, f);
+    // for (int i = 0; i < n_dims; ++i) {
+    //     int ne_ = (int) tensor->ne[i];
+    //     fwrite(&ne_, sizeof(ne_), 1, f);
+    // }
+    // fwrite(&len, sizeof(len), 1, f);
+    // fwrite(name, len, 1, f);
+    void* data = malloc(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, data, 0, ggml_nbytes(tensor));
+    // printf("[%d, %d] %zu\n", tensor->ne[0], tensor->ne[1], ggml_nbytes(tensor));
+    for(int r = 0;r < (tensor->ne[1] > 1 ? 10 : 1); r ++) {
+        for(int c = 0;c < 10; c ++) {
+            if(ttype == GGML_TYPE_F32) {
+                printf("%0.5ff, ",((float*)data)[r * tensor->ne[0] + c]);
+            } else if(ttype == GGML_TYPE_F16) {
+                printf("%0.5ff, ", __half2float(((half*)data)[r * tensor->ne[0] + c]));
+            }
+        }
+        printf("\n");
+    }
+    // if(tensor->ne[0] == 128 && tensor->ne[1] == 32) {
+    //     printf("BACKTRACKING: %.4f\n", ((float*)data)[113]);
+    // }
+    // fwrite(data, ggml_nbytes(tensor), 1, f);
+    free(data);
+    // fclose(f);
+}
+bool debug_kernel = true;
+
 inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F16);
@@ -12108,7 +12146,7 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
 #define TENSOR_ELEMENTS 256
 #define KV_BLOCK_SIZE 256
 
-        constexpr int num_warps = 8;
+        constexpr int num_warps = 1;
         constexpr int kv_per_block = KV_BLOCK_SIZE;
 
         // assert(kv_size % kv_per_block == 0);
@@ -12120,6 +12158,10 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
             (kv_per_block + 2)*sizeof(float) /* scores buffer */ +
             num_warps * (TENSOR_ELEMENTS + 2) * sizeof(float) /* tensor core result buffer per warp */;
 
+        if(ne01 == 1 && debug_kernel) {
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-k-256.tensor", src1, "Key data",   main_stream);
+        }
+
         int reduce_block = ((grid_dim.x + WMMA_M - 1) / WMMA_M) * WMMA_N;
         flash_attn_row<128, num_warps, 2, kv_per_block, TENSOR_ELEMENTS, WMMA_M, WMMA_N, WMMA_K><<<grid_dim, block_dim, shmem, main_stream>>>(
             (const float*)src0_extra->data_device[g_main_device],
@@ -12129,6 +12171,13 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
         fa_reduce<128, num_warps, TENSOR_ELEMENTS><<<ne02, block_dim, shmem, main_stream>>>(
             (const half*)src1_extra->data_device[g_main_device],
             (float *)dst_extra->data_device[g_main_device], ne11, ne11 / kv_per_block, reduce_block);
+        if(ne01 == 1 && debug_kernel) {
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-q-256.tensor", src0, "Query data", main_stream);
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-v-256.tensor", src2, "Value data", main_stream);
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-mask-256.tensor", src3, "Mask data", main_stream);
+            save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-qkv-256.tensor", dst, "QKV data", main_stream);
+            debug_kernel = false;
+        }
     }
 #endif
 
