@@ -7496,13 +7496,14 @@ static __global__ void flash_attn_ext_f16(
 template<int head_dim, int num_warps, int kv_tensor, int kv_block, int tensor_elements, int WMMA_M, int WMMA_N,int WMMA_K>
 __global__ void flash_attn_row(
     const float* query,
-    half* key /* reuse key buffer for partials result */,
+    const half* key /* reuse key buffer for partials result */,
     const half* value,
     const half* mask,
+    half* tmp,
     int kv_size,
     float scale,
-    int reduce_block,
-    int head_stride) {
+    int head_stride,
+    int r_kv_heads) {
 #if __CUDA_ARCH__ >= CC_VOLTA
     const int lane_index = threadIdx.x;
     const int warp_index = threadIdx.y;
@@ -7515,6 +7516,7 @@ __global__ void flash_attn_row(
     float* sscores      = (float*)(shmem + head_dim*kv_tensor*sizeof(half)); // scores buffer after QK^T
     float* warp_buffer  = (float*)(shmem + head_dim*kv_tensor*sizeof(half) + (kv_block + 2)*sizeof(float) + (warp_index*warp_data_size*sizeof(float)));
     const int HD2 = head_dim / 2;
+    const int kv_head_offset = (blockIdx.y / r_kv_heads) * head_stride;
 
     // load query with 128x2 shape (repeat row twice)
     const float2* query_ = (const float2*)(query + head_dim*blockIdx.y); // shift as head
@@ -7545,12 +7547,11 @@ __global__ void flash_attn_row(
 
         const int kv_per_warp = kv_block / num_warps;
         const int sum_diag = WMMA_K / kv_tensor;
-
         const int kvi = warp_index*kv_per_warp;
 
 #pragma unroll
         for (int kv = 0; kv < kv_per_warp; kv += kv_tensor) {
-            nvcuda::wmma::load_matrix_sync(key_m, key + head_stride*blockIdx.y + (blockIdx.x*kv_block + kvi + kv)*head_dim, 16);
+            nvcuda::wmma::load_matrix_sync(key_m, key + (blockIdx.x*kv_block + kvi + kv)*head_dim + kv_head_offset, 16);
             nvcuda::wmma::fill_fragment(kq_m, 0.0f);
             nvcuda::wmma::mma_sync(kq_m, query_m, key_m, kq_m);
             nvcuda::wmma::store_matrix_sync(warp_buffer, kq_m, 16, nvcuda::wmma::mem_row_major);
@@ -7564,7 +7565,6 @@ __global__ void flash_attn_row(
                     const int diag_idx = d0 + lane_index * sum_diag;
                     seq += warp_buffer[diag_idx*WMMA_M + diag_idx]; // sum diagonal
                 }
-
                 // store sequence result
                 sscores[seq_idx] = seq*scale + __half2float(mask[blockIdx.x*kv_block + seq_idx]); // save as float for softmax
             }
@@ -7623,8 +7623,6 @@ __global__ void flash_attn_row(
                 M0 = M;
             }
 
-            // printf("block M = %.4f, S= %.4f\n", M0, S0);
-
             // real softmax M and S for this block
             sscores[kv_block] = M0;
             sscores[kv_block + 1] = S0;
@@ -7659,18 +7657,23 @@ __global__ void flash_attn_row(
         half16x16_bT value_m;
         float16x16_acc qkv_m;
 
-        const int reduce_exccedent = reduce_block - gridDim.x;
+        // const int qkv_block_size = gridDim.x * head_dim + gridDim.x * 2;
+        // const int qkv_head_offset = kv_head_offset + (blockIdx.y % r_kv_heads) * qkv_block_size;
+
+        const int qkv_block_size = gridDim.x * head_dim + gridDim.x * 2;
+        const int qkv_head_offset = blockIdx.y * qkv_block_size;
+
 #pragma unroll
-        for(int h0 = 0; h0 < head_dim; h0 += num_warps) {
+    for(int h0 = 0; h0 < head_dim; h0 += num_warps) {
             const int hi = h0 + warp_index;
             if(hi >= head_dim) {
                 break;
             }
 
-            const int output_offset = blockIdx.y * head_stride + hi * reduce_block;
+            const int output_offset = qkv_head_offset + hi * gridDim.x;
 
             // `value` need to be transposed
-            nvcuda::wmma::load_matrix_sync(value_m, value + hi * kv_size + blockIdx.x*kv_block + blockIdx.y * head_stride, 16);
+            nvcuda::wmma::load_matrix_sync(value_m, value + hi * kv_size + blockIdx.x*kv_block + kv_head_offset, 16);
             nvcuda::wmma::fill_fragment(qkv_m, 0.0f);
             nvcuda::wmma::mma_sync(qkv_m, qk_m, value_m, qkv_m);
             nvcuda::wmma::store_matrix_sync(warp_buffer, qkv_m, 16, nvcuda::wmma::mem_row_major);
@@ -7683,18 +7686,13 @@ __global__ void flash_attn_row(
                     hdim += warp_buffer[d*WMMA_M + d]; // sum diagonal
                 }
 
-                // assume the key has been processed by blocks launched per head
-                key[output_offset + blockIdx.x] = __float2half(hdim);
-                key[blockIdx.y * head_stride + head_dim*reduce_block + blockIdx.x*2] = __float2half(sscores[kv_block]); // max of this kv block
-                key[blockIdx.y * head_stride + head_dim*reduce_block + blockIdx.x*2 + 1] = __float2half(sscores[kv_block + 1]); // sum of this kv block
-
-                if(blockIdx.x == 0) { // just the first block will do this
-                    for(int i = 0; i < reduce_exccedent; i ++) {
-                        // this is a padding to perform a matrix multiplication without incorrect values
-                        key[output_offset + gridDim.x + i] = __float2half(0.0f);
-                    }
-                }
+                tmp[output_offset + blockIdx.x] = __float2half(hdim);
             }
+        }
+
+        if(warp_index == 0 && lane_index == 0) {
+            tmp[qkv_head_offset + gridDim.x * head_dim + blockIdx.x*2] = __float2half(sscores[kv_block]); // max of this kv block
+            tmp[qkv_head_offset + gridDim.x * head_dim + blockIdx.x*2 + 1] = __float2half(sscores[kv_block + 1]); // sum of this kv block
         }
     }
 #else
@@ -7702,26 +7700,24 @@ __global__ void flash_attn_row(
 #endif
 }
 
-template<int head_dim, int num_warps, int tensor_elements>
-__global__ void fa_reduce(const half* red_buf, float* qkv, int kv_size, int num_kv_blocks, int reduce_block) {
+template<int head_dim, int num_warps>
+__global__ void fa_reduce(const half* partial_qkv, float* qkv, int kv_size, int num_kv_blocks, int r_kv_heads) {
     const int lane_index = threadIdx.x;
     const int warp_index = threadIdx.y;
 
-    const int head_offset = head_dim * kv_size * blockIdx.x;
+    const int qkv_partial_offset = blockIdx.x * (num_kv_blocks * head_dim + num_kv_blocks*2);
 
     extern __shared__ char shmem[];
-    half * sscale = (half *)shmem;
-    float* sf_lse = (float*)(shmem + tensor_elements*sizeof(half));
+    float* softmax_lse = (float *)shmem;
 
-    // make scale 1.0 diagonal
     if(warp_index == 0 && lane_index == 0) {
-        const int softmax_lse_offset = head_offset + head_dim*reduce_block;
-        float M0 = __half2float(red_buf[softmax_lse_offset]);
-        float S0 = __half2float(red_buf[softmax_lse_offset + 1]);
+        const int softmax_lse_offset = qkv_partial_offset + num_kv_blocks * head_dim;
+        float M0 = __half2float(partial_qkv[softmax_lse_offset]);
+        float S0 = __half2float(partial_qkv[softmax_lse_offset + 1]);
 
         for(int i = 1; i < num_kv_blocks; i++) {
-            float M1 = __half2float(red_buf[softmax_lse_offset + i*2]);
-            float S1 = __half2float(red_buf[softmax_lse_offset + i*2 + 1]);
+            float M1 = __half2float(partial_qkv[softmax_lse_offset + i*2]);
+            float S1 = __half2float(partial_qkv[softmax_lse_offset + i*2 + 1]);
 
             float M = fmaxf(M0, M1);
 
@@ -7731,11 +7727,11 @@ __global__ void fa_reduce(const half* red_buf, float* qkv, int kv_size, int num_
             S0 = S0*ms0 + S1*ms1;
             M0 = M;
 
-            sscale[i*2    ] = __float2half(ms0);
-            sscale[i*2 + 1] = __float2half(ms1);
+            softmax_lse[i*2    ] = ms0;
+            softmax_lse[i*2 + 1] = ms1;
         }
 
-        sf_lse[0] = S0;
+        softmax_lse[0] = S0;
     }
 
     __syncthreads();
@@ -7745,11 +7741,13 @@ __global__ void fa_reduce(const half* red_buf, float* qkv, int kv_size, int num_
     // reduce kv blocks (very slow!!)
     for(int hi = warp_index*hd_per_warp; hi < head_dim; hi += num_warps*hd_per_warp) {
         for(int hdi = lane_index; hdi < hd_per_warp; hdi += WARP_SIZE) {
-            float hdim = __half2float(red_buf[head_offset + (hi + hdi) * reduce_block]);
+            const int hdim_index = hi + hdi;
+            const int qkv_index = qkv_partial_offset + hdim_index * num_kv_blocks;
+            float hdim = __half2float(partial_qkv[qkv_index]);
             for(int kv = 1; kv < num_kv_blocks; kv++) {
-                hdim = hdim*__half2float(sscale[kv*2]) + __half2float(red_buf[head_offset + (hi + hdi) * reduce_block + kv]) * __half2float(sscale[kv*2 + 1]);
+                hdim = hdim * softmax_lse[kv*2] + __half2float(partial_qkv[qkv_index + kv]) * softmax_lse[kv * 2 + 1];
             }
-            qkv[blockIdx.x * head_dim + hi + hdi] = hdim / sf_lse[0];
+            qkv[blockIdx.x * head_dim + hdim_index] = hdim / softmax_lse[0];
         }
     }
 }
@@ -11963,8 +11961,8 @@ static void save_tensor_to_file(const char* filename, const ggml_tensor* tensor,
     void* data = malloc(ggml_nbytes(tensor));
     ggml_backend_tensor_get(tensor, data, 0, ggml_nbytes(tensor));
     // printf("[%d, %d] %zu\n", tensor->ne[0], tensor->ne[1], ggml_nbytes(tensor));
-    for(int r = 0;r < (tensor->ne[1] > 1 ? 16 : 1); r ++) {
-        for(int c = 0;c < 16; c ++) {
+    for(int r = 0;r < (tensor->ne[1] > 1 ? 6 : 1); r ++) {
+        for(int c = 0;c < 8; c ++) {
             if(ttype == GGML_TYPE_F32) {
                 printf("%0.5ff, ",((float*)data)[r * tensor->ne[0] + c]);
             } else if(ttype == GGML_TYPE_F16) {
@@ -12147,7 +12145,7 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
             save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-mask-256.tensor", src3, "Mask data");
             save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-qkv-256.tensor", dst, "QKV data");
             debug_kernel = false;
-        } else if(ne01 == 112 && debug_prompt) {
+        } else if(ne01 == 104 && debug_prompt) {
             printf("PROMPT PROCESSING\n");
             save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-q-256.tensor", src0, "Query data");
             save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-k-256.tensor", src1, "Key data");
@@ -12166,10 +12164,15 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
 
         constexpr int num_warps = 1;
         constexpr int kv_per_block = KV_BLOCK_SIZE;
+        int num_kv_blocks = ne11 / kv_per_block;
 
-        // assert(kv_size % kv_per_block == 0);
-        dim3 grid_dim(ne11 / kv_per_block, ne02, 1);
+        dim3 grid_dim(num_kv_blocks, ne02, 1);
         dim3 block_dim(WARP_SIZE, num_warps, 1);
+
+        half* tmp;
+        cudaMalloc((void **)&tmp,  ((num_kv_blocks * ne00) + num_kv_blocks*2) * ne02 * sizeof(half));
+
+        const int r_kv_heads = ne02 / ne12;
 
         int shmem =
             ne00*2*sizeof(half) /* query buffer */ +
@@ -12180,15 +12183,13 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
             save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-k-256.tensor", src1, "Key data");
         }
 
-        int reduce_block = ((grid_dim.x + WMMA_M - 1) / WMMA_M) * WMMA_N;
         flash_attn_row<128, num_warps, 2, kv_per_block, TENSOR_ELEMENTS, WMMA_M, WMMA_N, WMMA_K><<<grid_dim, block_dim, shmem, main_stream>>>(
             (const float*)src0_extra->data_device[g_main_device],
-            (half*)src1_extra->data_device[g_main_device],
-            (const half*)src2_extra->data_device[g_main_device],
-            (const half*)src3_extra->data_device[g_main_device], ne11, scale, reduce_block, ne10*ne11);
-        fa_reduce<128, num_warps, TENSOR_ELEMENTS><<<ne02, block_dim, shmem, main_stream>>>(
             (const half*)src1_extra->data_device[g_main_device],
-            (float *)dst_extra->data_device[g_main_device], ne11, ne11 / kv_per_block, reduce_block);
+            (const half*)src2_extra->data_device[g_main_device],
+            (const half*)src3_extra->data_device[g_main_device],
+            tmp, ne11, scale, ne10*ne11, r_kv_heads);
+        fa_reduce<128, num_warps><<<ne02, block_dim, shmem, main_stream>>>(tmp, (float *)dst_extra->data_device[g_main_device], ne11, num_kv_blocks, r_kv_heads);
         if(ne01 == 1 && debug_kernel) {
             printf("TOKEN GENERATION FLASH DECODING\n");
             save_tensor_to_file("C:\\proyectos\\kernel-data\\tg\\fa-cuda-q-256.tensor", src0, "Query data");
