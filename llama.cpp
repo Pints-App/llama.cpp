@@ -1,6 +1,6 @@
 #define LLAMA_API_INTERNAL
 #include "llama.h"
-#define GGML_FLASH_DECODING
+//#define GGML_FLASH_DECODING
 #include "unicode.h"
 
 #include "ggml.h"

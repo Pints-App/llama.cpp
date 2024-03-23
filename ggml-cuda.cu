@@ -1,7 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml.h"
 #include "ggml-backend-impl.h"
-#define GGML_FLASH_DECODING
+//#define GGML_FLASH_DECODING
 #include <algorithm>
 #include <assert.h>
 #include <atomic>
@@ -117,6 +117,7 @@
 #include <mma.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
+#include "fa_api.h"
 
 #if CUDART_VERSION < 11020
 #define CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED
@@ -12194,6 +12195,22 @@ static void save_tensor_to_file(const char* filename, const ggml_tensor* tensor,
     fclose(f);
 }
 
+__global__ void flash_ext_f32_f16(float* src, half* dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n) {
+        return;
+    }
+    dst[idx] = __float2half(src[idx]);
+}
+
+__global__ void flash_ext_f16_f32(half* src, float* dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n) {
+        return;
+    }
+    dst[idx] = __half2float(src[idx]);
+}
+
 bool debug_kernel = true, debug_prompt = true;
 
 inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
@@ -12234,6 +12251,34 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
 #ifdef GGML_FLASH_DECODING
     if(ne00 != 128 || ne01 > 1) {
 #endif
+        if(ne00 == 128 || ne00 == 64) { //
+            float* d_softmax_lse;
+            half* d_query, *d_qkv;
+
+            cudaMallocAsync((void **)&d_softmax_lse,  ne02 * ne01 * sizeof(float),  main_stream);
+            cudaMallocAsync((void **)&d_query, ggml_nelements(src0) * sizeof(half), main_stream);
+            cudaMallocAsync((void **)&d_qkv,   ggml_nelements(dst) * sizeof(half),  main_stream);
+
+            // convert query to half
+            int num_blocks = (ggml_nelements(src0) + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+            flash_ext_f32_f16<<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, main_stream>>>((float*)src0_extra->data_device[g_main_device], d_query, ggml_nelements(src0));
+
+            flash_attn_fwd(
+                d_query,
+                src1_extra->data_device[g_main_device],
+                src2_extra->data_device[g_main_device],
+                src3 ? src3_extra->data_device[g_main_device] : nullptr, d_qkv, d_softmax_lse,
+                ne00, ne01, ne11, ne02, ne12, 1, ne03, scale, main_stream);
+            cudaFreeAsync(d_softmax_lse, main_stream);
+
+            // convert output from f16 to f32
+            num_blocks = (ggml_nelements(dst) + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+            flash_ext_f16_f32<<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, main_stream>>>(d_qkv, (float*)dst_extra->data_device[g_main_device], ggml_nelements(dst));
+            cudaFreeAsync(d_query, main_stream);
+            cudaFreeAsync(d_qkv, main_stream);
+            return;
+        }
+
         const int nqpb = NQPB; // queries per block
         const int ncpw = NCPW; // cache values per warp (does not work for other values)
 
@@ -12352,6 +12397,7 @@ inline void ggml_cuda_flash_attn_ext(const ggml_tensor * src0, const ggml_tensor
             default:
                 break;
         }
+
 #ifdef GGML_FLASH_DECODING
     } else {
 #define WMMA_M 16

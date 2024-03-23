@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.14)  # for add_link_options and implicit target
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
+set(FLASH_DIR ../flash-attention-cpp)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
@@ -351,12 +353,18 @@ if (LLAMA_CUBLAS)
 
     find_package(CUDAToolkit)
     if (CUDAToolkit_FOUND)
+        link_directories(${FLASH_DIR}/build/Release)
         message(STATUS "cuBLAS found")
 
         enable_language(CUDA)
 
         set(GGML_HEADERS_CUDA ggml-cuda.h)
         set(GGML_SOURCES_CUDA ggml-cuda.cu)
+
+        set(LLAMA_EXTRA_INCLUDES ${LLAMA_EXTRA_INCLUDES}
+            ${FLASH_DIR}
+            ${FLASH_DIR}/fa
+            ${FLASH_DIR}/cutlass/include)
 
         add_compile_definitions(GGML_USE_CUBLAS)
         if (LLAMA_CUDA_FORCE_DMMV)
@@ -379,12 +387,12 @@ if (LLAMA_CUBLAS)
         if (LLAMA_STATIC)
             if (WIN32)
                 # As of 12.3.1 CUDA Tookit for Windows does not offer a static cublas library
-                set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} CUDA::cudart_static CUDA::cublas CUDA::cublasLt)
+                set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} CUDA::cudart_static CUDA::cublas CUDA::cublasLt flash_attn)
             else ()
                 set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} CUDA::cudart_static CUDA::cublas_static CUDA::cublasLt_static)
             endif()
         else()
-            set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} CUDA::cudart CUDA::cublas CUDA::cublasLt)
+            set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} CUDA::cudart CUDA::cublas CUDA::cublasLt flash_attn)
         endif()
 
         set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} CUDA::cuda_driver)
