@@ -353,7 +353,12 @@ if (LLAMA_CUBLAS)
 
     find_package(CUDAToolkit)
     if (CUDAToolkit_FOUND)
-        link_directories(${FLASH_DIR}/build/Release)
+        if (WIN32)
+            link_directories(${FLASH_DIR}/build/Release)
+        else()
+            link_directories(${FLASH_DIR}/build)
+        endif()
+
         message(STATUS "cuBLAS found")
 
         enable_language(CUDA)
