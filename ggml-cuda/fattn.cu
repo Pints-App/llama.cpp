@@ -601,7 +601,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
         // Performance of the vector kernel is very bad for head sizes 80 and 112, use the tensor core kernel instead:
         constexpr int nwarps_tc = 4;
-        constexpr dim3 block_dim_tc(WARP_SIZE, nwarps_tc, 1);
+        dim3 block_dim_tc(WARP_SIZE, nwarps_tc, 1);
 
         const dim3 blocks_num_combine(1, blocks_num.y, blocks_num.z);
         const dim3 block_dim_combine(Q->ne[0], 1, 1);

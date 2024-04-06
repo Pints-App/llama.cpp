@@ -2130,7 +2130,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             CUDA_CHECK(cudaMemsetAsync(dev_cur_src1_row.get(), 0, sizeof(int), stream));
 
             {
-                dim3 block_dims(std::min((uint)nb11, 1024u));
+                dim3 block_dims(std::min((uint32_t)nb11, 1024u));
                 dim3 grid_dims(ids->ne[1], n_ids);
                 k_copy_src1_to_contiguous<<<grid_dims, block_dims, 0, stream>>>(
                         src1_original, src1_contiguous.get(),
@@ -2162,7 +2162,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 #ifndef MMID_MEMCPY
             {
-                dim3 block_dims(std::min((uint)nb1, 1024u));
+                dim3 block_dims(std::min((uint32_t)nb1, 1024u));
                 dim3 grid_dims(num_src1_rows);
                 k_copy_dst_from_contiguous<<<grid_dims, block_dims, 0, stream>>>(
                         dst_original, dst_contiguous.get(),
