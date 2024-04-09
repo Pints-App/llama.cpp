@@ -2198,12 +2198,23 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 }
 
+static long times[GGML_OP_COUNT];
+static long count[GGML_OP_COUNT];
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     // why is this here instead of mul_mat?
     if (dst->src[0] != nullptr && ggml_backend_buffer_is_cuda_split(dst->src[0]->buffer)) {
         ggml_cuda_set_peer_access(dst->src[1]->ne[1], ctx.device);
     }
-
+    // printf("%15s : %5s => %30s - %.4f MB\n", ggml_op_name(dst->op), ggml_type_name(dst->type), ggml_get_name(dst), ggml_nbytes(dst) / 1024.f / 1024.f);
+    cudaStreamSynchronize(ctx.streams[ctx.device][0]);
+    if(strcmp(ggml_get_name(dst), "norm-0") == 0) {
+        for(int i =0; i < GGML_OP_COUNT;i++) {
+            times[i] = 0;
+            count[i] = 0;
+        }
+    }
+    long start = ggml_time_us();
     switch (dst->op) {
         case GGML_OP_REPEAT:
             ggml_cuda_op_repeat(ctx, dst);
@@ -2342,7 +2353,25 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         default:
             return false;
     }
-
+    cudaStreamSynchronize(ctx.streams[ctx.device][0]);
+    times[dst->op] += ggml_time_us() - start;
+    count[dst->op]++;
+    if(strcmp(ggml_get_name(dst), "result_output") == 0) {
+        printf("============================ cuda timings ==========================\n");
+        float total_time = 0.0f;
+        for(int i = 0; i < GGML_OP_COUNT;i++) {
+            if(count[i] > 0) {
+                total_time += times[i] / 1000.0f;
+            }
+        }
+        for(int i = 0; i < GGML_OP_COUNT;i++) {
+            if(count[i] > 0) {
+                float t = times[i] / 1000.0f;
+                printf("%3d | %15s | %4.3f ms | %2.2f %%\n", count[i], ggml_op_name((ggml_op)i), t, (t / total_time) * 100.f);
+            }
+        }
+        printf("%3d | %15s | %4.3f ms | %2.2f %%\n", 0, "Total", total_time, 100.f);
+    }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: %s failed\n", __func__, ggml_op_desc(dst));
