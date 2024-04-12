@@ -2201,7 +2201,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 static long times[GGML_OP_COUNT];
 static long count[GGML_OP_COUNT];
 
-static int layer = 0;
 static bool compute = false;
 
 static void print_gpu_tensor(ggml_tensor* tensor, const char* name) {
@@ -2222,6 +2221,15 @@ static void print_gpu_tensor(ggml_tensor* tensor, const char* name) {
         }
     }
     printf(")\n");
+    int elms = (int)(ggml_nelements(tensor) * 0.2f);
+    for(int i =0; i < elms;i ++) {
+        float data_ = tensor->type == GGML_TYPE_F32 ?
+            ((float*)data)[i] : __half2float(((half*)data)[i]);
+        if(isnan(data_)) {
+            printf("NaN found\n");
+            abort();
+        }
+    }
     free(data);
 }
 
@@ -2380,19 +2388,17 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     cudaStreamSynchronize(ctx.streams[ctx.device][0]);
     if(dst->op == GGML_OP_FLASH_ATTN_EXT) {
         if(compute) {
-            printf("==============> flash_attn %i <==============\n\n", layer);
+            printf("==============> %s <==============\n\n", ggml_get_name(dst));
             print_gpu_tensor(dst->src[0], "query");
-            print_gpu_tensor(dst->src[1], "key");
+            print_gpu_tensor(dst->src[1], "key  ");
             print_gpu_tensor(dst->src[2], "value");
             print_gpu_tensor(dst, "kqv");
         }
-        layer ++;
     }
     if(strcmp(ggml_get_name(dst), "result_output") == 0) {
         if(!compute) {
             compute = true;
         }
-        layer %= 31;
     }
     times[dst->op] += ggml_time_us() - start;
     count[dst->op]++;

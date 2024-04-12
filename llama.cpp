@@ -5915,6 +5915,7 @@ static struct ggml_tensor * llm_build_kqv(
     cb(v, "v", il);
 
     cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale);
+    ggml_format_name(cur, "flash-attn-%i", il);
     ggml_flash_attn_ext_set_prec(cur, GGML_PREC_DEFAULT);
     //printf("q: %4d %4d %4d %4d\n", q->ne[0], q->ne[1], q->ne[2], q->ne[3]);
     //printf("k: %4d %4d %4d %4d\n", k->ne[0], k->ne[1], k->ne[2], k->ne[3]);
