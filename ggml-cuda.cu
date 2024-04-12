@@ -2201,37 +2201,37 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 static long times[GGML_OP_COUNT];
 static long count[GGML_OP_COUNT];
 
-static bool compute = false;
+// static bool compute = false;
 
-static void print_gpu_tensor(ggml_tensor* tensor, const char* name) {
-    printf("%s-[%4d, %4d, %4d] -> (", name, tensor->ne[0], tensor->ne[1], tensor->ne[2]);
-    void* data = malloc(ggml_nbytes(tensor));
-    ggml_backend_tensor_get(tensor, data, 0, ggml_nbytes(tensor));
-    for(int i = 0; i < 16; i++) {
-        int data_index = i > 7 ? ggml_nelements(tensor) + i - 16 : i;
-        float data_ = tensor->type == GGML_TYPE_F32 ?
-            ((float*)data)[data_index] : __half2float(((half*)data)[data_index]);
-        if(i == 8) {
-            printf(", ...");
-        }
-        if(i == 0) {
-            printf("%3.2f", data_);
-        } else {
-            printf(", %3.2f", data_);
-        }
-    }
-    printf(")\n");
-    int elms = (int)(ggml_nelements(tensor) * 0.2f);
-    for(int i =0; i < elms;i ++) {
-        float data_ = tensor->type == GGML_TYPE_F32 ?
-            ((float*)data)[i] : __half2float(((half*)data)[i]);
-        if(isnan(data_)) {
-            printf("NaN found\n");
-            abort();
-        }
-    }
-    free(data);
-}
+// static void print_gpu_tensor(ggml_tensor* tensor, const char* name) {
+//     printf("%s-[%4d, %4d, %4d] -> (", name, tensor->ne[0], tensor->ne[1], tensor->ne[2]);
+//     void* data = malloc(ggml_nbytes(tensor));
+//     ggml_backend_tensor_get(tensor, data, 0, ggml_nbytes(tensor));
+//     for(int i = 0; i < 16; i++) {
+//         int data_index = i > 7 ? ggml_nelements(tensor) + i - 16 : i;
+//         float data_ = tensor->type == GGML_TYPE_F32 ?
+//             ((float*)data)[data_index] : __half2float(((half*)data)[data_index]);
+//         if(i == 8) {
+//             printf(", ...");
+//         }
+//         if(i == 0) {
+//             printf("%3.2f", data_);
+//         } else {
+//             printf(", %3.2f", data_);
+//         }
+//     }
+//     printf(")\n");
+//     int elms = (int)(ggml_nelements(tensor) * 0.2f);
+//     for(int i =0; i < elms;i ++) {
+//         float data_ = tensor->type == GGML_TYPE_F32 ?
+//             ((float*)data)[i] : __half2float(((half*)data)[i]);
+//         if(isnan(data_)) {
+//             printf("NaN found\n");
+//             abort();
+//         }
+//     }
+//     free(data);
+// }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     // why is this here instead of mul_mat?
@@ -2386,38 +2386,38 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             return false;
     }
     cudaStreamSynchronize(ctx.streams[ctx.device][0]);
-    if(dst->op == GGML_OP_FLASH_ATTN_EXT) {
-        if(compute) {
-            printf("==============> %s <==============\n\n", ggml_get_name(dst));
-            print_gpu_tensor(dst->src[0], "query");
-            print_gpu_tensor(dst->src[1], "key  ");
-            print_gpu_tensor(dst->src[2], "value");
-            print_gpu_tensor(dst, "kqv");
-        }
-    }
-    if(strcmp(ggml_get_name(dst), "result_output") == 0) {
-        if(!compute) {
-            compute = true;
-        }
-    }
+    // if(dst->op == GGML_OP_FLASH_ATTN_EXT) {
+    //     if(compute) {
+    //         printf("==============> %s <==============\n\n", ggml_get_name(dst));
+    //         print_gpu_tensor(dst->src[0], "query");
+    //         print_gpu_tensor(dst->src[1], "key  ");
+    //         print_gpu_tensor(dst->src[2], "value");
+    //         print_gpu_tensor(dst, "kqv");
+    //     }
+    // }
+    // if(strcmp(ggml_get_name(dst), "result_output") == 0) {
+    //     if(!compute) {
+    //         compute = true;
+    //     }
+    // }
     times[dst->op] += ggml_time_us() - start;
     count[dst->op]++;
-    // if(strcmp(ggml_get_name(dst), "result_output") == 0) {
-    //     printf("============================ cuda timings ==========================\n");
-    //     float total_time = 0.0f;
-    //     for(int i = 0; i < GGML_OP_COUNT;i++) {
-    //         if(count[i] > 0) {
-    //             total_time += times[i] / 1000.0f;
-    //         }
-    //     }
-    //     for(int i = 0; i < GGML_OP_COUNT;i++) {
-    //         if(count[i] > 0) {
-    //             float t = times[i] / 1000.0f;
-    //             printf("%3d | %15s | %4.3f ms | %2.2f %%\n", count[i], ggml_op_name((ggml_op)i), t, (t / total_time) * 100.f);
-    //         }
-    //     }
-    //     printf("%3d | %15s | %4.3f ms | %2.2f %%\n", 0, "Total", total_time, 100.f);
-    // }
+    if(strcmp(ggml_get_name(dst), "result_output") == 0) {
+        printf("============================ cuda timings ==========================\n");
+        float total_time = 0.0f;
+        for(int i = 0; i < GGML_OP_COUNT;i++) {
+            if(count[i] > 0) {
+                total_time += times[i] / 1000.0f;
+            }
+        }
+        for(int i = 0; i < GGML_OP_COUNT;i++) {
+            if(count[i] > 0) {
+                float t = times[i] / 1000.0f;
+                printf("%3d | %15s | %4.3f ms | %2.2f %%\n", count[i], ggml_op_name((ggml_op)i), t, (t / total_time) * 100.f);
+            }
+        }
+        printf("%3d | %15s | %4.3f ms | %2.2f %%\n", 0, "Total", total_time, 100.f);
+    }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: %s failed\n", __func__, ggml_op_desc(dst));
